@@ -52,6 +52,20 @@ class SupplyCurve:
         self.costs = np.array([plant.cost for plant in self.plants])
         self.eta = eta
 
+    def _plant_quantities(self, p):
+        """Per-plant quantities supplied at the given price(s).
+
+        Args:
+            p (array): Prices to evaluate the curve at.
+
+        Returns:
+            array: Quantities per plant, shape (len(p), n_plants).
+        """
+        p_arr = np.atleast_1d(np.asarray(p, dtype=float))[:, np.newaxis]
+        l = lambda x: 1.0 / (1.0 + np.exp(-SHARPNESS * (x / (MIN_PRICE_FACTOR * self.costs) - 1.0)))
+        A = self.capacities / (l(self.costs) * self.costs ** self.eta)
+        return l(p_arr) * A * p_arr ** self.eta  # (m, n_plants)
+
     def __call__(self, p):
         """Evaluation of the supply curve.
 
@@ -62,10 +76,7 @@ class SupplyCurve:
             array: Resulting quantities for each price.
         """
 
-        p_arr = np.atleast_1d(np.asarray(p, dtype=float))[:, np.newaxis]  # (m, 1) broadcasts against costs (n_plants,)
-        l = lambda x: 1.0 / (1.0 + np.exp(-SHARPNESS * (x / (MIN_PRICE_FACTOR * self.costs) - 1.0)))
-        A = self.capacities / (l(self.costs) * self.costs ** self.eta)
-        supply = np.sum(l(p_arr) * A * p_arr ** self.eta, axis=-1)  # (m,) -- one total per price
+        supply = self._plant_quantities(p).sum(axis=-1)
         return supply.item() if np.isscalar(p) else supply
 
 class SupplyCurve2D():

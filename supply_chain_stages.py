@@ -4,67 +4,122 @@ from utils import CompositeDemand, SupplyCurve, SupplyCurve2D, DemandCurve, find
 
 class SupplyPlant:
     def __init__(self, capacity, cost, intensity=None):
+        """Generic type for a plant that produces a material.
+
+        Args:
+            capacity (float): Avaialble capacity.
+            cost (float): Marginal cost
+            intensity (float, optional): How much of the upstream material is needed for production. Defaults to None.
+        """
         self.capacity = capacity
         self.cost = cost
-        self.intensity = intensity  # None -> inherits the stage's default intensity
+        self.intensity = intensity
 
-    def update(self, **kwargs):
+    def update(self, ctx):
         return type(self)(self.capacity, self.cost * 1.025, intensity=self.intensity)
 
 class Mine(SupplyPlant):
     def __init__(self, capacity, cost, ore_grade=None):
+        """Subtype of plant specifically for a mining stage.
+
+        Args:
+            capacity (float): Avaialble capacity.
+            cost (float): Marginal cost
+            ore_grade (float, optional): Ore grade of the mine. Defaults to None.
+        """
         super().__init__(capacity, cost)
         self.ore_grade = ore_grade
 
-    def update(self, **kwargs):
+    def update(self, ctx):
         return Mine(self.capacity * 0.975, self.cost * 1.025, ore_grade=self.ore_grade)
 
 class WasteStream(SupplyPlant):
-    def __init__(self, capacity, cost, capacity_ratio=None):
+    def __init__(self, capacity, cost, capacity_ratio=None, source=None, mode="flow", stock=None):
+        """Subtype of plant specifically for a waste stream stage.
+
+        Args:
+            capacity (float): Available capacity. In stock mode this is the current reservoir.
+            cost (float): Marginal cost.
+            capacity_ratio (float): Fraction of the source stage's production that becomes collectable scrap.
+            source (str, optional): Name of the stage whose production feeds this stream. By default it is the stream's own stage.
+            mode (str): "flow" (capacity = this year's inflow) or "stock" (capacity = running reservoir).
+            stock (float, optional): Current reservoir size (stock mode only). Defaults to the initial capacity.
+        """
         # Recycled feedstock: doesn't consume the upstream input by default, so its cost is independent of the upstream price
         super().__init__(capacity, cost, intensity=0)
         self.capacity_ratio = capacity_ratio
+        self.source = source
+        self.mode = mode
+        self.stock = capacity if stock is None else stock
 
-    def update(self, total_production=None, **kwargs):
-        return WasteStream(self.capacity_ratio * total_production, self.cost * 1.025, capacity_ratio=self.capacity_ratio, intensity=self.intensity)
+    def update(self, ctx):
+        # Inflow feeds off the source stage's production; source=None means this stream's own stage
+        source = self.source if self.source is not None else ctx.stage_name_of(self)
+        inflow = self.capacity_ratio * ctx.production_of(source)
+
+        if self.mode == "stock":
+            # Reservoir grows by inflow, shrinks by what this plant actually recycled last year
+            new_stock = max(self.stock + inflow - ctx.consumed_by(self), 0.0)
+            new_capacity = new_stock
+        else:
+            new_stock = None
+            new_capacity = inflow
+
+        return WasteStream(new_capacity, self.cost * 1.025, capacity_ratio=self.capacity_ratio,
+                           source=self.source, mode=self.mode, stock=new_stock)
 
 
 class SupplyChainStage():
-    def __init__(self, supply, demand):
+    def __init__(self, supply, demand, name):
         """Representation of one supply chain stage.
 
         Args:
             supply (callable): Supply for that stage.
             demand (callable): Demand for that stage.
+            name (str): Human-readable stage name (e.g. "midstream"). Used so plants can reference
+                another stage's production by name.
         """
 
         self.supply = supply
         self.demand = demand
+        self.name = name
         self.parent = None
         if isinstance(demand, CompositeDemand):
             for downstream in demand.downstreams:
                 downstream.parent = self
         self.p_eq = None
 
-    def update(self, new_children=None):
+    def update(self, new_children=None, ctx=None):
         """Upates the stage for the next iteration."""
 
         if self.p_eq is None:
             raise ValueError("Equilibrium price not set, cannot update stage.")
 
-        return type(self)(self._new_supply(new_children), self._new_demand(new_children))
+        return type(self)(self._new_supply(new_children, ctx), self._new_demand(new_children), name=self.name)
 
-    def _new_supply(self, new_children):
+    def add_plants(self, new_plants):
+        """Append plants to this stage, rebuilding the supply curve so its cached arrays stay consistent.
+
+        Args:
+            new_plants (list): Plants to add to the stage's supply.
+        """
+        plants = np.concatenate([self.supply.plants, new_plants])
+        if isinstance(self.supply, SupplyCurve2D):
+            self.supply = SupplyCurve2D(plants, intensity=self.supply.intensity,
+                                        p_u_ref=self.supply.p_u_ref, eta=self.supply.eta)
+        else:
+            self.supply = SupplyCurve(plants, eta=self.supply.eta)
+
+    def _new_supply(self, new_children, ctx=None):
         """Depending on the stage type, update supply."""
 
         # If the stage is mid or downstream, delegate to each plant's own update rule
         if isinstance(self.supply, SupplyCurve2D):
-            total_production = self.supply(self.p_eq)
-            new_plants = [p.update(total_production=total_production) for p in self.supply.plants]
+            new_plants = [p.update(ctx) for p in self.supply.plants]
             return SupplyCurve2D(new_plants, intensity=self.supply.intensity, p_u_ref=self.parent.p_eq, eta=self.supply.eta)
-        
+
         # If isn't, we keep the same supply
-        return self.supply 
+        return self.supply
 
     def _new_demand(self, new_children):
         """Depending on the stage type, update demand."""
@@ -124,7 +179,7 @@ class SupplyChainStage():
 
 
 class MiningStage(SupplyChainStage):
-    def __init__(self, supply, demand, incentive_pool, resource_pool, incentive_ratio):
+    def __init__(self, supply, demand, incentive_pool, resource_pool, incentive_ratio, name):
         """Subtype of a SupplyChainStage representing a mining stage.
 
         Args:
@@ -133,9 +188,10 @@ class MiningStage(SupplyChainStage):
             incentive_pool (array): List of mines making up the incentive pool.
             resource_pool (array): List of mines making up the resource pool.
             incentive_ratio (float): Ratio of incentive pool capacity to total supply capacity.
+            name (str): Human-readable stage name.
         """
 
-        super().__init__(supply, demand)
+        super().__init__(supply, demand, name)
         self.incentive_pool = incentive_pool
         self.resource_pool = resource_pool
         self.incentive_ratio = incentive_ratio
@@ -145,14 +201,14 @@ class MiningStage(SupplyChainStage):
         if np.around(real_incentive_ratio, 2) < np.around(incentive_ratio, 2):
             raise ValueError(f"Incentive pool capacity is smaller than the specified incentive ratio ({real_incentive_ratio:.2f} vs {incentive_ratio:.2f}).")
 
-    def update(self, new_children):
+    def update(self, new_children, ctx=None):
         """Update the mines for the next iteration."""
 
         if self.p_eq is None:
             raise ValueError("Equilibrium price not set, cannot update stage.")
 
         # Change mine parameters and filter out mines that are too expensive to operate at the current price
-        new_upstream_mines = [mine.update() for mine in self.supply.plants]
+        new_upstream_mines = [mine.update(ctx) for mine in self.supply.plants]
         new_upstream_mines_left = np.array([mine for mine in new_upstream_mines if mine.cost <= self.p_eq])
 
         # Calculate supply gap based on temp supply and demand
@@ -179,6 +235,7 @@ class MiningStage(SupplyChainStage):
         resource_mines = sorted_resource_mines[~to_transfer_mask]
 
         # Create the new MiningStage with updated supply, demand, incentive pool, and resource pool
-        new_stage = MiningStage(new_supply, new_demand, incentive_mines, resource_mines, incentive_ratio=self.incentive_ratio)
+        new_stage = MiningStage(new_supply, new_demand, incentive_mines, resource_mines,
+                                incentive_ratio=self.incentive_ratio, name=self.name)
 
         return new_stage
