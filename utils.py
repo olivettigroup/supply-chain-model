@@ -10,16 +10,6 @@ MINE_DISTRIBUTION_COST_MIN = 0.0647
 MIN_PRICE_FACTOR = 0.95
 SHARPNESS = 500
 
-class SupplyPlant:
-    def __init__(self, capacity, cost):
-        self.capacity = capacity
-        self.cost = cost
-
-class Mine(SupplyPlant):
-    def __init__(self, capacity, cost, ore_grade=None):
-        super().__init__(capacity, cost)
-        self.ore_grade = ore_grade
-
 def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000)):
     """Randomly generates a number of plants for any supply chain stage
 
@@ -47,31 +37,6 @@ def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000)):
     samples[:, 1] = cost_min + samples[:, 1] * (cost_max - cost_min)
 
     return samples[:, 0]*total_capacity/samples[:, 0].sum(), samples[:, 1]
-
-# def marginal_curve(p, eta, cost_ref, capacity_ref):
-#     """Marginal cost curve function for a given capacity and cost.
-
-#     Args:
-#         p (array of float): Price to evaluate the function at.
-#         eta (float): Price elasticity.
-#         cost_ref (float): Reference cost for the plant.
-#         capacity_ref (float): Reference capacity for the plant.
-#         min_price (float, optional): Price floor below which no production will happen. Defaults to 0.95.
-#         sharpness (float, optional): Steepness of the logistic modulation. Defaults to 500.
-
-#     Returns:
-#         array of float: Production quantities at a given marginal price.
-#     """
-
-#     # Logistic modulation to smooth out the transition to 0
-#     sharpness = 500 #1000/p_min
-#     l = lambda x: 1 / (1 + np.exp(-sharpness * (x / (MIN_PRICE_FACTOR * cost_ref) - 1)))
-    
-#     # Rescale A so that l(p_ref) * A * p_ref**eta == q_ref
-#     l_ref = l(cost_ref)
-#     A = capacity_ref / (l_ref * cost_ref**eta)
-    
-#     return l(p) * A * p**eta
 
 class SupplyCurve:
     def __init__(self, plants, eta=0.1):
@@ -109,7 +74,7 @@ class SupplyCurve2D():
 
         Args:
             plants (list): List of supply plants.
-            intensity (float): Conversion factor between this stage and the upstream one.
+            intensity (float): Default upstream input required per unit output, for plants that don't set their own (plant.intensity is None).
             p_u_ref (float): Reference price at which the costs are defined.
             eta (float, optional): Elasticity for the marginal price curves. Defaults to 0.1.
             min_price (float, optional): Price floor for the marginal price curves. Defaults to 0.95.
@@ -118,9 +83,30 @@ class SupplyCurve2D():
         self.capacities = np.array([plant.capacity for plant in self.plants])
         self.costs = np.array([plant.cost for plant in self.plants])
         self.intensity = intensity
+        self.plant_intensities = np.array([intensity if plant.intensity is None else plant.intensity for plant in self.plants])
         self.p_u_ref = p_u_ref
-        self.min_costs = self.costs - intensity*p_u_ref
+        self.min_costs = self.costs - self.plant_intensities*p_u_ref
         self.eta = eta
+
+    def _plant_quantities(self, p_d, p_u=None):
+        """Per-plant quantities supplied at the given price(s).
+
+        Args:
+            p_d (array): Prices to evaluate the curve at.
+            p_u (float, optional): Upstream price. Defaults to None.
+
+        Returns:
+            array: Quantities per plant, shape (len(p_d), n_plants).
+        """
+        if p_u is None:
+            p_u = self.p_u_ref
+
+        costs_for_p_u = self.plant_intensities*p_u + self.min_costs
+
+        p_arr = np.atleast_1d(np.asarray(p_d, dtype=float))[:, np.newaxis]
+        l = lambda x: 1.0 / (1.0 + np.exp(-SHARPNESS * (x / (MIN_PRICE_FACTOR * costs_for_p_u) - 1.0)))
+        A = self.capacities / (l(costs_for_p_u) * costs_for_p_u ** self.eta)
+        return l(p_arr) * A * p_arr ** self.eta  # (m, n_plants)
 
     def __call__(self, p_d, p_u=None):
         """Evaluation of the supply curve.
@@ -132,19 +118,25 @@ class SupplyCurve2D():
         Returns:
             array: Resulting quantities for each price.
         """
-        if p_u is None:
-            p_u = self.p_u_ref
+        supply = self._plant_quantities(p_d, p_u).sum(axis=-1)
 
-        supply = np.zeros_like(p_d).astype(float)
-
-        costs_for_p_u = self.intensity*p_u + self.min_costs
-
-        p_arr = np.atleast_1d(np.asarray(p_d, dtype=float))[:, np.newaxis]  # (m, 1) broadcasts against costs (n_plants,)
-        l = lambda x: 1.0 / (1.0 + np.exp(-SHARPNESS * (x / (MIN_PRICE_FACTOR * costs_for_p_u) - 1.0)))
-        A = self.capacities / (l(costs_for_p_u) * costs_for_p_u ** self.eta)
-        supply = np.sum(l(p_arr) * A * p_arr ** self.eta, axis=-1)  # (m,) -- one total per price
-        
         return supply.item() if np.isscalar(p_d) else supply
+
+    def upstream_demand(self, p_d, p_u=None):
+        """Quantity of upstream input consumed to produce this stage's output at the given price(s).
+
+        Plants with intensity=0 (e.g. a WasteStream that doesn't consume the upstream input) contribute nothing.
+
+        Args:
+            p_d (array): Prices to evaluate the curve at.
+            p_u (float, optional): Upstream price. Defaults to None.
+
+        Returns:
+            array: Resulting upstream quantities for each price.
+        """
+        demand = (self._plant_quantities(p_d, p_u) * self.plant_intensities).sum(axis=-1)
+
+        return demand.item() if np.isscalar(p_d) else demand
     
 class DemandCurve():
     def __init__(self, p_nom, q_nom, elas):
@@ -193,69 +185,9 @@ def find_intersection(supply_curve, demand_curve, bracket):
 
     return root_scalar(f, bracket=(p_lo, p_hi), method="brentq").root
 
-class SupplyChainStage():
-    def __init__(self, supply, demand, children=[]):
-        """Representation of one supply chain stage.
-
-        Args:
-            supply (callable): Supply for that stage.
-            demand (callable): Demand for that stage.
-            children (list, optional): Downstream stages that depend on the price of this stage. Defaults to [].
-        """
-        self.supply = supply
-        self.demand = demand
-        self.children = children
-        self.p_eq = None
-        
-    def get_equilibrium_price(self, p_u=None):
-        """Find the equilibrium price (intersection of supply and demand) for this stage. At an upstream price p_u if need be.
-
-        Args:
-            p_u (float, optional): Upstream price. Defaults to None.
-
-        Returns:
-            float: Equilibrium price.
-        """
-
-        # raise Exception("This function is deprecated. Use solve_chain() to solve the entire supply chain simultaneously.")
-
-        if isinstance(self.supply, SupplyCurve2D):
-            p_u_eff = p_u if p_u is not None else self.supply.p_u_ref
-            costs = self.supply.intensity * p_u_eff + self.supply.min_costs
-            s = lambda p: self.supply(p, p_u=p_u)
-        else:
-            costs = self.supply.costs
-            s = self.supply
-        bracket = (max(costs.min() * 0.1, 1e-12), costs.max() * 10.0)
-        return find_intersection(s, self.demand, bracket=bracket)
-    
-    def plot_sd(self, ax, p_u=None):
-        """Helpful function to plot the supply and demand curves for the stage.
-
-        Args:
-            ax (pyplot ax): Axes for the figure
-            p_u (float, optional): Upstream price. Defaults to None.
-        """
-        if self.supply.__class__ == SupplyCurve2D:
-            costs_for_p_u = self.supply.intensity * (p_u if p_u is not None else self.supply.p_u_ref) + self.supply.min_costs
-            y = np.linspace(1e-20, 1.5*costs_for_p_u.max(), 200)
-            ax.plot(self.supply(y, p_u=p_u), y, lw=2, zorder=3, label="Supply")
-        else:
-            y = np.linspace(1e-20, 1.5*self.supply.costs.max(), 200)
-            ax.plot(self.supply(y), y, lw=2, zorder=3, label="Supply")
-
-        x_lims = ax.get_xlim()
-        ax.plot(self.demand(y[::4]), y[::4], lw=2, zorder=3, label="Demand")
-
-        ax.set_xlim(x_lims)
-        ax.grid()
-
-        ax.set_xlabel('Quantity')
-        ax.set_ylabel('Price')
-
 class CompositeDemand():
     def __init__(self, downstreams, other=0):
-        """Summs the demand from one or more downstream stages.
+        """Sums the demand from one or more downstream stages.
 
         Args:
             downstreams (SupplyChainStages): Supply chain stages that are downstream.
@@ -279,17 +211,25 @@ class CompositeDemand():
 
         for i, pi in enumerate(p_arr):
             for downstream in self.downstreams:
-                supply[i] += downstream.supply.intensity * downstream.supply(downstream.get_equilibrium_price(pi), p_u=pi)
+                supply[i] += downstream.supply.upstream_demand(downstream.get_equilibrium_price(pi), p_u=pi)
 
         supply += self.other
         
         return supply.item() if scalar_input else supply
 
-def build_chain(root_node):
+def build_chain(start_node):
+    """Given any node in the graph, builds the parents and children index list with ordered nodes list.
+
+    Args:
+        start_node (SupplyChainStage): Any stage in the supply chain graph.
+
+    Returns:
+        lists: Lists of nodes, parent, and children.
     """
-    Walk the supply chain stage graph to build relationships. Returns the ordered stage list
-    as well as parent[] and children[] index lists.
-    """
+
+    root_node = start_node
+    while root_node.parent is not None:
+        root_node = root_node.parent
 
     nodes, parent, children = [], [], []
 
@@ -309,10 +249,16 @@ def build_chain(root_node):
     return nodes, parent, children
 
 def _residuals(logp, nodes, parent, children):
-    """
-    Flat market-clearing residuals (supply - demand) per stage, in log-price space.
-    logp is an array of len(nodes).
-    Normalised by fixed stage capacity so every residual is O(1).
+    """Price residuals for every stage.
+
+    Args:
+        logp (array): Log of prices.
+        nodes (array): List of SupplyChainStages.
+        parent (array): Parent node for every stage.
+        children (array): Children nodes for every stage.
+
+    Returns:
+        array: Residuals between supply and demand for every stage at prices logp.
     """
 
     # Transform back into regular space
@@ -328,7 +274,7 @@ def _residuals(logp, nodes, parent, children):
     res = np.empty(len(nodes))
     for i, node in enumerate(nodes):
         if isinstance(node.demand, CompositeDemand):
-            D = node.demand.other + sum(nodes[c].supply.intensity * S[c] for c in children[i])
+            D = node.demand.other + sum(nodes[c].supply.upstream_demand(p[c], p[i]) for c in children[i])
         else:
             D = node.demand.A * p[i] ** node.demand.elas
         
@@ -338,11 +284,17 @@ def _residuals(logp, nodes, parent, children):
     return res
 
 def solve_chain(nodes, parent, children, p0=None):
-    """Solve an entire supply chain simultaneously for all equilibrium prices.
+    """Solves the prices for one SupplyChain
 
-    Returns ({stage: price}, scipy_result) and also writes each price to stage.p_eq.
-    Robust to the initial guess; pass p0 (array over stages, root first) to override the
-    default of each stage's mean plant cost."""
+    Args:
+        nodes (array): List of SupplyChainStages.
+        parent (array): Parent node for every stage.
+        children (array): Children nodes for every stage.
+        p0 (array, optional): Initial guesses. Defaults to None.
+
+    Returns:
+        dict: Dictionnary with SupplyChainStages as keys and their equilibrium prices as values.
+    """
     
     # Prices can't sit below cheapest plant
     lb = np.log(np.array([n.supply.costs.min() * 0.5 for n in nodes]))  
