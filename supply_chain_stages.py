@@ -1,6 +1,7 @@
 import numpy as np
 from utils import CompositeDemand, SupplyCurve, SupplyCurve2D, DemandCurve, find_intersection
 
+CHANGE = 0.01
 
 class SupplyPlant:
     def __init__(self, capacity, cost, intensity=None):
@@ -16,7 +17,7 @@ class SupplyPlant:
         self.intensity = intensity
 
     def update(self, ctx):
-        return type(self)(self.capacity, self.cost * 1.025, intensity=self.intensity)
+        return type(self)(self.capacity, self.cost / (1-CHANGE), intensity=self.intensity)
 
 class Mine(SupplyPlant):
     def __init__(self, capacity, cost, ore_grade=None):
@@ -31,7 +32,7 @@ class Mine(SupplyPlant):
         self.ore_grade = ore_grade
 
     def update(self, ctx):
-        return Mine(self.capacity * 0.975, self.cost * 1.025, ore_grade=self.ore_grade)
+        return Mine(self.capacity * (1-CHANGE), self.cost / (1-CHANGE), ore_grade=self.ore_grade)
 
 class WasteStream(SupplyPlant):
     def __init__(self, capacity, cost, capacity_ratio=None, source=None, mode="flow", stock=None):
@@ -65,7 +66,7 @@ class WasteStream(SupplyPlant):
             new_stock = None
             new_capacity = inflow
 
-        return WasteStream(new_capacity, self.cost * 1.025, capacity_ratio=self.capacity_ratio,
+        return WasteStream(new_capacity, self.cost / (1-CHANGE), capacity_ratio=self.capacity_ratio,
                            source=self.source, mode=self.mode, stock=new_stock)
 
 
@@ -130,7 +131,7 @@ class SupplyChainStage():
         
         # TODO: make demand curve update more sophisticated
         # If the stage is a leaf stage (all the way downstream), then we update the demand curve
-        return DemandCurve(p_nom=self.p_eq, q_nom=self.demand.q_nom * 1.025, elas=self.demand.elas)
+        return DemandCurve(p_nom=self.p_eq, q_nom=self.demand.q_nom * (1+CHANGE), elas=self.demand.elas)
 
     def get_equilibrium_price(self, p_u=None):
         """Find the equilibrium price (intersection of supply and demand) for this stage. At an upstream price p_u if need be.
