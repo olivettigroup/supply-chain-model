@@ -1,6 +1,8 @@
 import numpy as np
 from utils import CompositeDemand, SupplyCurve, SupplyCurve2D, DemandCurve, find_intersection
+import copy
 
+YEARS_UNPROFITABLE_THRESHOLD = 3
 CHANGE = 0.01
 
 class SupplyPlant:
@@ -20,19 +22,23 @@ class SupplyPlant:
         return type(self)(self.capacity, self.cost / (1-CHANGE), intensity=self.intensity)
 
 class Mine(SupplyPlant):
-    def __init__(self, capacity, cost, ore_grade=None):
+    def __init__(self, capacity, cost, ore_grade=None, years_unprofitable=0, years_in_pool=0):
         """Subtype of plant specifically for a mining stage.
 
         Args:
             capacity (float): Avaialble capacity.
             cost (float): Marginal cost
             ore_grade (float, optional): Ore grade of the mine. Defaults to None.
+            years_unprofitable (int): Number of years the mine has been unprofitable.
+            years_in_pool (int): Number of years the mine has been in a given pool.
         """
         super().__init__(capacity, cost)
         self.ore_grade = ore_grade
+        self.years_unprofitable = years_unprofitable
+        self.years_in_pool = years_in_pool
 
     def update(self, ctx):
-        return Mine(self.capacity * (1-CHANGE), self.cost / (1-CHANGE), ore_grade=self.ore_grade)
+        return Mine(self.capacity * (1-CHANGE), self.cost / (1-CHANGE), ore_grade=self.ore_grade, years_unprofitable=self.years_unprofitable, years_in_pool=self.years_in_pool + 1)
 
 class WasteStream(SupplyPlant):
     def __init__(self, capacity, cost, capacity_ratio=None, source=None, mode="flow", stock=None):
@@ -193,8 +199,10 @@ class MiningStage(SupplyChainStage):
         """
 
         super().__init__(supply, demand, name)
-        self.incentive_pool = incentive_pool
-        self.resource_pool = resource_pool
+        self.resource_pool = resource_pool # Based on gap
+        self.developing_pool = [] # 4 years
+        self.incentive_pool = incentive_pool # NPV opening
+        self.opening_pool = [] # 2 years
         self.incentive_ratio = incentive_ratio
 
         # Check that the incentive pool capacity is consistent with the specified incentive ratio
@@ -202,38 +210,91 @@ class MiningStage(SupplyChainStage):
         if np.around(real_incentive_ratio, 2) < np.around(incentive_ratio, 2):
             raise ValueError(f"Incentive pool capacity is smaller than the specified incentive ratio ({real_incentive_ratio:.2f} vs {incentive_ratio:.2f}).")
 
+    def update_opening_to_operating(self, new_operating_mines):
+        new_opening_pool = copy.deepcopy(self.opening_pool)
+        for mine in new_opening_pool:
+            if mine.years_in_pool >= 2:
+                mine.years_in_pool = 0
+                new_operating_mines.append(mine)
+                new_opening_pool.remove(mine)
+
+        return new_opening_pool, new_operating_mines
+
+    def update_incentive_to_opening(self, new_opening_pool):
+        # Some NPV calculation
+        new_incentive_pool = copy.deepcopy(self.incentive_pool)
+        for mine in new_incentive_pool:
+            if mine.cost < self.p_eq:
+                mine.years_in_pool = 0
+                new_opening_pool.append(mine)
+                new_incentive_pool.remove(mine)
+
+        return new_incentive_pool, new_opening_pool
+    
+    def update_developing_to_incentive(self, new_incentive_pool):
+        new_developing_pool = copy.deepcopy(self.developing_pool)
+        for mine in new_developing_pool:
+            if mine.years_in_pool >= 4:
+                mine.years_in_pool = 0
+                new_incentive_pool.append(mine)
+                new_developing_pool.remove(mine)
+
+        return new_developing_pool, new_incentive_pool
+    
+    def update_resource_to_developing(self, new_developing_pool):
+        # Some quantity gap calculation
+        new_resource_pool = copy.deepcopy(self.resource_pool)
+        for mine in self.incentive_pool:
+            if mine.cost < self.p_eq:
+                mine.years_in_pool = 0
+                new_developing_pool.append(mine)
+                new_resource_pool.remove(mine)
+
+        return new_resource_pool, new_developing_pool
+
     def update(self, new_children, ctx=None):
         """Update the mines for the next iteration."""
 
         if self.p_eq is None:
-            raise ValueError("Equilibrium price not set, cannot update stage.")
+            raise ValueError("Equilibrium not yet found, cannot update stage.")
 
         # Change mine parameters and filter out mines that are too expensive to operate at the current price
-        new_upstream_mines = [mine.update(ctx) for mine in self.supply.plants]
-        new_upstream_mines_left = np.array([mine for mine in new_upstream_mines if mine.cost <= self.p_eq])
+        updated_mines = [mine.update(ctx) for mine in self.supply.plants]
+        closing_mines = []
+        new_operating_mines = []
+        for mine in updated_mines:
+            if mine.cost > self.p_eq and mine.years_unprofitable >= YEARS_UNPROFITABLE_THRESHOLD - 1:
+                closing_mines.append(mine)
+            else:
+                new_operating_mines.append(mine)
 
-        # Calculate supply gap based on temp supply and demand
-        temp_supply_curve = SupplyCurve(new_upstream_mines_left)
-        new_demand = CompositeDemand(new_children)
-        supply_gap = new_demand(self.p_eq) - temp_supply_curve(self.p_eq)
+        new_opening_pool, new_operating_mines = self.update_opening_to_operating(new_operating_mines)
+        new_incentive_pool, new_opening_pool = self.update_incentive_to_opening(new_opening_pool)
+        new_developing_pool, new_incentive_pool = self.update_developing_to_incentive(new_incentive_pool)
+        new_resource_pool, new_developing_pool = self.update_resource_to_developing(new_developing_pool)
 
-        # Sort incentive mines and find which ones to open based on supply gap
-        sorted_incentive_mines = np.array(sorted(self.incentive_pool, key=lambda x: x.cost))
-        sorted_incentive_capacities = np.array([mine.capacity for mine in sorted_incentive_mines])
-        to_open_mask = (np.cumsum(sorted_incentive_capacities) - sorted_incentive_capacities) <= supply_gap
-        new_upstream_mines = np.concatenate([new_upstream_mines_left, sorted_incentive_mines[to_open_mask]])
+        # # Calculate supply gap based on temp supply and demand
+        # temp_supply_curve = SupplyCurve(updated_operating_mines)
+        # new_demand = CompositeDemand(new_children)
+        # supply_gap = new_demand(self.p_eq) - temp_supply_curve(self.p_eq)
 
-        # Based on this, create the new upstream
-        new_supply = SupplyCurve(new_upstream_mines)
+        # # Sort incentive mines and find which ones to open based on supply gap
+        # sorted_incentive_mines = np.array(sorted(self.incentive_pool, key=lambda x: x.cost))
+        # sorted_incentive_capacities = np.array([mine.capacity for mine in sorted_incentive_mines])
+        # to_open_mask = (np.cumsum(sorted_incentive_capacities) - sorted_incentive_capacities) <= supply_gap
+        # updated_mines = np.concatenate([updated_operating_mines, sorted_incentive_mines[to_open_mask]])
 
-        # Replenish the incentive curve with new mines
-        incentive_mines_left = sorted_incentive_mines[~to_open_mask]
-        incentive_gap = new_supply.capacities.sum()*self.incentive_ratio - sum(mine.capacity for mine in incentive_mines_left)
-        sorted_resource_mines = np.array(sorted(self.resource_pool, key=lambda x: x.cost))
-        sorted_resource_capacities = np.array([mine.capacity for mine in sorted_resource_mines])
-        to_transfer_mask = (np.cumsum(sorted_resource_capacities) - sorted_resource_capacities) <= incentive_gap
-        incentive_mines = np.concatenate([incentive_mines_left, sorted_resource_mines[to_transfer_mask]])
-        resource_mines = sorted_resource_mines[~to_transfer_mask]
+        # # Based on this, create the new upstream
+        # new_supply = SupplyCurve(updated_mines)
+
+        # # Replenish the incentive curve with new mines
+        # incentive_mines_left = sorted_incentive_mines[~to_open_mask]
+        # incentive_gap = new_supply.capacities.sum()*self.incentive_ratio - sum(mine.capacity for mine in incentive_mines_left)
+        # sorted_resource_mines = np.array(sorted(self.resource_pool, key=lambda x: x.cost))
+        # sorted_resource_capacities = np.array([mine.capacity for mine in sorted_resource_mines])
+        # to_transfer_mask = (np.cumsum(sorted_resource_capacities) - sorted_resource_capacities) <= incentive_gap
+        # incentive_mines = np.concatenate([incentive_mines_left, sorted_resource_mines[to_transfer_mask]])
+        # resource_mines = sorted_resource_mines[~to_transfer_mask]
 
         # Create the new MiningStage with updated supply, demand, incentive pool, and resource pool
         new_stage = MiningStage(new_supply, new_demand, incentive_mines, resource_mines,
