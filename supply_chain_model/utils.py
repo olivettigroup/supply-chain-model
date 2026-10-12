@@ -16,19 +16,22 @@ SHARPNESS = 500
 # SupplyChain.solve_prices warns if it binds at a solved price.
 MIN_COST_FACTOR = 0.05
 
-def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000)):
+def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000), rng=None):
     """Randomly generates a number of plants for any supply chain stage
 
     Args:
         n_plants (int): Number of plants to generate
         total_capacity (float, optional): Total capacity to distribute among the plants. Defaults to 300.
         cost_bounds (tuple, optional): Bounds for the generated costs. Defaults to (1000, 5000).
+        rng (numpy.random.Generator, optional): Random generator, for reproducible draws. Defaults to a
+            fresh unseeded one.
 
     Returns:
         arrays: Arrays of length n_plants for capacities and costs
     """
 
-    rng = np.random.default_rng()
+    if rng is None:
+        rng = np.random.default_rng()
     
     # Generate random samples in log space
     samples = rng.multivariate_normal(mean=MINE_DISTRIBUTION_MEAN, cov=MINE_DISTRIBUTION_COV, size=(n_plants))
@@ -81,7 +84,7 @@ class SupplyCurve:
         The plants are mutated in place every year, so anything derived from them
         (capacities, costs) goes stale unless this is called afterwards.
         """
-        self.capacities = np.array([plant.capacity for plant in self.plants], dtype=float)
+        self.capacities = np.array([plant.usable_capacity for plant in self.plants], dtype=float)
         self.costs = np.array([plant.cost for plant in self.plants], dtype=float)
 
     def set_plants(self, plants):
@@ -136,6 +139,8 @@ class SupplyCurve2D():
         # Last year's upstream price; the stage moves it with the parent's price every year
         self.p_u = p_u_ref
         self.eta = eta
+        plants = list(plants)
+        self._quote(plants)
         self.set_plants(plants)
 
     def refresh(self):
@@ -144,30 +149,45 @@ class SupplyCurve2D():
         The plants are mutated in place every year, so every array derived from them has to be
         rebuilt afterwards.
         """
-        self.capacities = np.array([plant.capacity for plant in self.plants], dtype=float)
+        self.capacities = np.array([plant.usable_capacity for plant in self.plants], dtype=float)
         self.conversion_costs = np.array([plant.conversion_cost for plant in self.plants], dtype=float)
         self.plant_intensities = np.array([plant.intensity for plant in self.plants], dtype=float)
         self.costs = self.conversion_costs + self.plant_intensities*self.p_u
 
-    def set_plants(self, plants):
-        """Replace the plant list and refresh the cached arrays.
+    def _quote(self, plants):
+        """Split each new plant's total cost, quoted at the curve's upstream price, into conversion
+        cost and input cost. Plants without their own intensity get the curve's.
 
-        Each plant's current total cost is taken as quoted at this curve's upstream price and split
-        into conversion cost and input cost on that basis. For plants already on the curve this
-        changes nothing, since their total cost is already at that price.
+        Args:
+            plants (list): Plants joining the curve for the first time.
         """
-        self.plants = np.array(list(plants), dtype=object)
-        for plant in self.plants:
+        for plant in plants:
             if plant.intensity is None:
                 plant.intensity = self.intensity
             plant.conversion_cost = plant.cost - plant.intensity*self.p_u
+
+    def set_plants(self, plants):
+        """Replace the plant list and refresh the cached arrays. Conversion costs are kept as they are,
+        so this also takes back plants that sat off the curve for a while (e.g. under construction).
+
+        Args:
+            plants (list): Plants whose conversion cost and intensity are already set.
+        """
+        self.plants = np.array(list(plants), dtype=object)
+        for plant in self.plants:
             plant.upstream_price = self.p_u
         self.refresh()
 
     def add_plants(self, new_plants):
-        """Append plants and refresh the cached arrays. New plants' costs are quoted at the curve's
-        current upstream price."""
-        self.set_plants(list(self.plants) + list(new_plants))
+        """Append new plants, with costs quoted at the curve's current upstream price, and refresh the
+        cached arrays.
+
+        Args:
+            new_plants (list): Plants joining the curve for the first time.
+        """
+        new_plants = list(new_plants)
+        self._quote(new_plants)
+        self.set_plants(list(self.plants) + new_plants)
 
     def set_upstream_price(self, p_u):
         """Move the curve and its plants to a new upstream price. Conversion costs are unchanged.
@@ -324,6 +344,29 @@ class CompositeDemand():
         supply += self.other
         
         return supply.item() if scalar_input else supply
+
+def cheapest_covering(plants, gap):
+    """Greedy gap fill: the cheapest plants whose combined capacity covers a gap.
+
+    Plants are taken in order of cost until their nameplate capacity reaches the gap, including the
+    plant that crosses it.
+
+    Args:
+        plants (list): Candidate plants.
+        gap (float): Capacity to cover. Nothing is selected if it is not positive.
+
+    Returns:
+        list: The selected plants, cheapest first.
+    """
+    if gap <= 0 or len(plants) == 0:
+        return []
+
+    ordered = sorted(plants, key=lambda plant: plant.cost)
+    capacities = np.array([plant.capacity for plant in ordered], dtype=float)
+
+    # Capacity already committed before each plant, so the one straddling the gap is included
+    committed = np.cumsum(capacities) - capacities
+    return [plant for plant, before in zip(ordered, committed) if before < gap]
 
 def build_chain(start_node):
     """Given any node in the graph, builds the parents and children index list with ordered nodes list.

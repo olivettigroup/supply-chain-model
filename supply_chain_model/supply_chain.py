@@ -17,12 +17,39 @@ class ModelParams:
         end_year (int): Last model year.
         price_smoothing_weight (float): Weight on this year's equilibrium price in the decision price.
             1 switches smoothing off.
-        grade_decline_rate (float): Annual ore-grade decline of mines.
+        grade_decline_rate (float): Annual ore-grade decline of producing mines, used by the default grade_fn.
+        discount_rate (float): Real discount rate in the mine NPV.
+        mine_life (int): Years of production counted in the mine NPV.
+        feasibility_time (int): Years a mine spends in "developing".
+        construction_time (int): Years a mine spends in "opening".
+        default_reserve_life (float): Reserves of a mine whose data has none, in years of capacity.
+        incentive_ratio (float): Target for incentive + developing capacity, as a fraction of the mining
+            stage's production last year.
+        closed_destination (str): Pool a closed mine returns to.
+        closed_cooldown (int): Years a mine spends in "closed" before returning.
+        plant_construction_time (int): Years a processing plant spends in "construction".
+        plant_learning_rate (float): Annual fall in processing conversion costs.
+        expansion_utilisation_threshold (float): Utilisation of a processing stage above which it expands.
+        expansion_target_utilisation (float): Utilisation that expansion builds back to.
+        expansion_cost_percentile (float): Percentile of operating conversion costs given to template plants.
     """
     start_year: int = 2024
     end_year: int = 2050
     price_smoothing_weight: float = 0.34
     grade_decline_rate: float = 0.01
+    discount_rate: float = 0.15
+    mine_life: int = 20
+    feasibility_time: int = 4
+    construction_time: int = 2
+    default_reserve_life: float = 25
+    incentive_ratio: float = 0.5
+    closed_destination: str = "developing"
+    closed_cooldown: int = 1
+    plant_construction_time: int = 2
+    plant_learning_rate: float = 0.01
+    expansion_utilisation_threshold: float = 0.90
+    expansion_target_utilisation: float = 0.85
+    expansion_cost_percentile: float = 50
 
 
 class SupplyChain:
@@ -45,7 +72,7 @@ class SupplyChain:
         self.params = params if params is not None else ModelParams()
         self.stages, self.parent, self.children = build_chain(own_stages[0])
         for stage in self.stages:
-            stage.params = self.params
+            stage.set_params(self.params)
         self.mine_idx = [k for k, s in enumerate(self.stages) if isinstance(s, MiningStage)]
         self.plant_idx = [k for k, s in enumerate(self.stages) if not isinstance(s, MiningStage)]
 
@@ -128,8 +155,8 @@ class SupplyChain:
         if empty:
             raise ValueError(
                 f"Stage(s) {empty} have no plants left, so there is no supply curve to solve. "
-                "For a MiningStage this usually means every mine retired and the pipeline did not "
-                "open anything to replace them.")
+                "For a MiningStage this usually means every operating mine closed or ran out and the "
+                "pipeline did not open anything to replace them.")
 
         # Warm start from last year's prices when we have them. Once the chain has run a while these
         # sit much closer to the answer than the per-stage cost means the solver would otherwise use.
@@ -179,7 +206,7 @@ class SupplyChain:
             if i > 0:
                 # Built once, eagerly, from last year's solved chain. Stages may only read this, never
                 # each other, so it doesn't matter what order they get stepped in.
-                ctx = StageContext(self.stages)
+                ctx = StageContext(self.stages, t)
                 for stage in self.stages:
                     stage.step(ctx)
 
@@ -218,8 +245,8 @@ class SupplyChain:
                         "cost": plant.cost,
                         # Only the operating pool actually produces anything
                         "production": produced.get(plant.uid, 0.0),
-                        "ore_grade": getattr(plant, "ore_grade", None),
-                        "years_unprofitable": getattr(plant, "years_unprofitable", 0),
+                        "grade": getattr(plant, "grade", None),
+                        "reserves": getattr(plant, "reserves", None),
                         "years_in_pool": getattr(plant, "years_in_pool", 0),
                     })
 
@@ -249,15 +276,17 @@ def _plant_output(stage, prices=None):
 
 
 class StageContext:
-    def __init__(self, stages):
+    def __init__(self, stages, year):
         """Read-only view of the just-solved chain, so a plant's step() can look up global info by name.
 
         Everything is worked out up front. The stages get mutated one by one afterwards, so anything
         read lazily would see a half-updated chain.
 
         Args:
-            stages (list): The current year's solved SupplyChainStages (each with p_eq set).
+            stages (list): Last year's solved SupplyChainStages (each with p_eq set).
+            year (int): The year being stepped into.
         """
+        self.year = year
         self._prices = {s.name: s.p_eq for s in stages}
         self._decision_prices = {s.name: s.decision_price for s in stages}
 

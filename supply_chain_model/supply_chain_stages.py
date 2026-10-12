@@ -2,18 +2,20 @@ import itertools
 
 import numpy as np
 
-from .utils import CompositeDemand, SupplyCurve2D, find_intersection
+from .utils import CompositeDemand, SupplyCurve2D, cheapest_covering, find_intersection
 
-YEARS_UNPROFITABLE_THRESHOLD = 3
-# Annual escalation of processing-plant and waste-stream conversion costs, and annual leaf demand growth
+# Annual leaf demand growth
 CHANGE = 0.01
+
+# Numerical guard: a mine whose remaining reserves fall below this fraction of its capacity is exhausted
+EXHAUSTION_TOLERANCE = 1e-9
 
 
 class SupplyPlant:
     # Shared counter so every plant ever built gets a different uid
     _uid_counter = itertools.count()
 
-    def __init__(self, capacity, cost, intensity=None, uid=None):
+    def __init__(self, capacity, cost, intensity=None, years_in_pool=0, synthetic=False, uid=None):
         """Generic type for a plant that produces a material.
 
         The plant's primitive cost is its conversion cost, the non-material cost per unit of output.
@@ -22,9 +24,13 @@ class SupplyPlant:
 
         Args:
             capacity (float): Avaialble capacity.
-            cost (float): Total marginal cost. A SupplyCurve2D takes it as quoted at the curve's upstream
-                price and splits it into conversion cost and input cost when the plant joins.
+            cost (float): Total marginal cost. When the plant is given to a SupplyCurve2D constructor or
+                add_plants, it is taken as quoted at the curve's upstream price and split into
+                conversion cost and input cost; otherwise it is the conversion cost.
             intensity (float, optional): How much of the upstream material is needed for production. Defaults to None.
+            years_in_pool (int, optional): Full years spent in the current pool. Defaults to 0.
+            synthetic (bool, optional): True for plants the model or the data generator created.
+                Defaults to False.
             uid (int, optional): Stable identifier, kept for the plant's whole life so it can be tracked
                 across years in the chain's records. Defaults to the next value of the shared counter.
         """
@@ -33,62 +39,74 @@ class SupplyPlant:
         self.intensity = intensity
         self.conversion_cost = cost
         self.upstream_price = 0.0
+        self.years_in_pool = years_in_pool
+        self.synthetic = synthetic
+        self.pool_history = []
 
     @property
     def cost(self):
         """Total cost per unit of output, at last year's upstream price."""
         return self.conversion_cost + (self.intensity or 0.0)*self.upstream_price
 
+    @property
+    def usable_capacity(self):
+        """Capacity the supply curve can use this year."""
+        return self.capacity
+
     @classmethod
     def reset_uids(cls):
         """Restart the uid counter. Call before building a chain if you want uids to be reproducible."""
         SupplyPlant._uid_counter = itertools.count()
 
-    def step(self, ctx, pool="operating"):
-        """Advance this plant by one year, in place.
-
-        Args:
-            ctx (StageContext): Read-only view of last year's solved chain.
-            pool (str): Name of the pool the plant currently sits in.
-        """
-        self.conversion_cost /= (1 - CHANGE)
-
 
 class Mine(SupplyPlant):
-    def __init__(self, capacity, cost, ore_grade=None, years_unprofitable=0, years_in_pool=0, uid=None):
-        """Subtype of plant specifically for a mining stage.
+    def __init__(self, capacity, cost, grade=1.0, recovery=1.0, reserves=None, capex=None, years_in_pool=0,
+                 uid=None):
+        """A deposit, described by its ore and its reserves.
+
+        The primitives are ore_throughput, grade, recovery and ore_cost; capacity and cost are derived
+        from them, so a change in grade moves both. Given only capacity and cost (grade and recovery 1),
+        the mine behaves like a plain plant with that capacity and cost.
 
         Args:
-            capacity (float): Avaialble capacity.
-            cost (float): Marginal cost
-            ore_grade (float, optional): Ore grade of the mine. Defaults to None.
-            years_unprofitable (int): Number of years the mine has been unprofitable.
-            years_in_pool (int): Number of years the mine has been in a given pool.
+            capacity (float): Nameplate capacity at the given grade and recovery (saleable product per year).
+            cost (float): Cost per unit of saleable product at the given grade and recovery.
+            grade (float, optional): Metal content of the ore. Defaults to 1.
+            recovery (float, optional): Fraction of the contained metal that ends up as saleable product.
+                Defaults to 1.
+            reserves (float, optional): Saleable product still in the deposit. Defaults to
+                params.default_reserve_life * capacity, filled in when the stage gets its parameters.
+            capex (float, optional): Total capex in currency. Defaults to the stage's
+                capex_intensity * capacity, filled in when the stage is built.
+            years_in_pool (int, optional): Full years spent in the current pool. Defaults to 0.
             uid (int, optional): Stable identifier. Defaults to the next value of the shared counter.
         """
-        super().__init__(capacity, cost, uid=uid)
-        self.ore_grade = ore_grade
-        self.years_unprofitable = years_unprofitable
+        self.uid = next(SupplyPlant._uid_counter) if uid is None else uid
+        self.grade = grade
+        self.recovery = recovery
+        self.ore_throughput = capacity/(grade*recovery)
+        self.ore_cost = cost*grade*recovery
+        self.reserves = reserves
+        self.capex = capex
         self.years_in_pool = years_in_pool
+        # Set when the mine passes the NPV gate, and on every move between pools
+        self.npv_at_decision = None
+        self.pool_history = []
 
-    def step(self, ctx, params, pool="operating"):
-        """Advance this mine by one year, in place: grade decline raises its cost, and lowers its
-        capacity if it is operating.
+    @property
+    def capacity(self):
+        """Nameplate capacity: ore_throughput * grade * recovery."""
+        return self.ore_throughput*self.grade*self.recovery
 
-        years_in_pool is deliberately not touched here: MinePipeline.step owns the ageing so there is
-        exactly one place where it happens, for every pool at once.
+    @property
+    def cost(self):
+        """Cost per unit of saleable product: ore_cost / (grade * recovery)."""
+        return self.ore_cost/(self.grade*self.recovery)
 
-        Args:
-            ctx (StageContext): Read-only view of last year's solved chain.
-            params (ModelParams): Model parameters; uses grade_decline_rate.
-            pool (str): Name of the pool the mine currently sits in.
-        """
-        # A mine has no upstream input, so its conversion cost is its whole cost
-        self.conversion_cost /= (1 - params.grade_decline_rate)
-
-        # Only a producing mine depletes its reserves
-        if pool == "operating":
-            self.capacity *= (1 - params.grade_decline_rate)
+    @property
+    def usable_capacity(self):
+        """Nameplate capacity capped at the remaining reserves (uncapped while reserves are unknown)."""
+        return self.capacity if self.reserves is None else min(self.capacity, self.reserves)
 
 
 class WasteStream(SupplyPlant):
@@ -111,8 +129,12 @@ class WasteStream(SupplyPlant):
         self.mode = mode
         self.stock = capacity if stock is None else stock
 
-    def step(self, ctx, pool="operating"):
-        """Advance this waste stream by one year, in place."""
+    def step(self, ctx):
+        """Waste-stream capacity: set this year's capacity from the source stage's production last year.
+
+        Args:
+            ctx (StageContext): Read-only view of last year's solved chain.
+        """
 
         # Inflow feeds off the source stage's production; source=None means this stream's own stage
         source = self.source if self.source is not None else ctx.stage_name_of(self)
@@ -125,246 +147,231 @@ class WasteStream(SupplyPlant):
         else:
             self.capacity = inflow
 
-        self.conversion_cost /= (1 - CHANGE)
-
 
 # ---------------------------------------------------------------------------
 # Pool machinery
 #
-# Two different things that are easy to mix up:
-#   - Pool / Transition / MinePipeline describe the RULES. They are the shape of the pipeline
-#     and stay the same every year.
-#   - stage.pools is a plain dict {pool name: list of plants} and holds the MEMBERSHIP.
+# Pipeline describes the pools and moves plants between them; the stage's step() says which moves
+# happen in which order. stage.pools is a plain dict {pool name: list of plants} and holds the
+# membership.
 # ---------------------------------------------------------------------------
 
-class Transition:
-    def __init__(self, select, to, name=None):
-        """One rule for moving plants out of a pool and into another.
+class Pipeline:
+    def __init__(self, names, frozen=()):
+        """The pools a stage's plants move through.
 
         Args:
-            select (callable): select(plants, ctx) -> list of the plants that should move. It gets the
-                whole list rather than one plant at a time so that rules based on the group (cumulative
-                capacity against a gap, say) are expressible. Use per_mine() to build one out of a
-                simple per-plant test.
-            to (str): Name of the destination pool.
-            name (str, optional): Label used in error messages. Defaults to "-> <to>".
+            names (iterable): Pool names, upstream first. The pool called "operating" makes up the
+                stage's supply curve.
+            frozen (iterable): Pools whose plants never age or move again.
         """
-        self.select = select
-        self.to = to
-        self.name = name if name is not None else f"-> {to}"
-
-
-class Pool:
-    def __init__(self, name, transitions=(), frozen=False):
-        """One pool in a pipeline, and the rules for leaving it.
-
-        Args:
-            name (str): Pool name, e.g. "incentive". The pool called "operating" is the one whose
-                plants make up the stage's supply curve.
-            transitions (iterable): Transitions out of this pool, tried in order.
-            frozen (bool): If True the plants in this pool don't age and aren't stepped. Used for pools
-                that are only a record of what happened, like "retired".
-        """
-        self.name = name
-        self.transitions = list(transitions)
-        self.frozen = frozen
-
-
-class MinePipeline:
-    def __init__(self, pools):
-        """An ordered chain of pools plus the rules for moving between them.
-
-        Pools are listed upstream-first (furthest from production first). Stepping happens in the
-        opposite direction so a plant can only advance one pool per year.
-
-        Args:
-            pools (iterable): Pool objects, upstream-first.
-        """
-        self.pools = list(pools)
-
-        names = self.names
-        if len(set(names)) != len(names):
-            raise ValueError(f"Duplicate pool names in pipeline: {names}")
-        if "operating" not in names:
+        self.names = list(names)
+        self.frozen = set(frozen)
+        if "operating" not in self.names:
             raise ValueError("A pipeline needs a pool called 'operating' to feed the supply curve.")
-        for pool in self.pools:
-            for transition in pool.transitions:
-                if transition.to not in names:
-                    raise ValueError(f"Pool {pool.name} has a transition to unknown pool {transition.to}.")
-
-    @property
-    def names(self):
-        """Pool names, upstream-first."""
-        return [pool.name for pool in self.pools]
-
-    def pool(self, name):
-        """Get a Pool by name."""
-        for pool in self.pools:
-            if pool.name == name:
-                return pool
-        raise KeyError(name)
+        if not self.frozen <= set(self.names):
+            raise ValueError(f"Frozen pools {sorted(self.frozen - set(self.names))} are not in the pipeline.")
 
     def empty_pools(self):
         """A fresh membership dict with one empty list per pool."""
         return {name: [] for name in self.names}
 
-    def step(self, pools, ctx):
-        """Age every plant by a year and run all the transitions once.
+    def move(self, pools, from_pool, to_pool, rule, ctx, moved):
+        """Run one transition: move the plants that the rule selects from one pool to another.
+
+        Plants that already moved in this step are not offered to the rule, so no plant moves twice in
+        a year. Movers get years_in_pool = 0 and a (year, to_pool) entry in their pool_history.
 
         Args:
             pools (dict): Membership dict, mutated in place.
-            ctx (PoolContext): What the transition rules get to look at.
-
-        Returns:
-            dict: The same membership dict.
+            from_pool (str): Pool to move plants out of.
+            to_pool (str): Pool to move them into.
+            rule (callable): rule(plants, ctx) -> list of the plants that move.
+            ctx (PoolContext): What the rule gets to look at.
+            moved (set): uids of plants that moved earlier in this step; updated in place.
         """
+        if to_pool not in pools:
+            raise ValueError(f"Unknown pool {to_pool!r}; this pipeline has {self.names}.")
 
-        # Age everything first, in one place, so that the "n years in this pool" rules can ever fire
-        for pool in self.pools:
-            if pool.frozen:
+        movers = rule([plant for plant in pools[from_pool] if plant.uid not in moved], ctx)
+        if not movers:
+            return
+
+        uids = {plant.uid for plant in movers}
+        pools[from_pool] = [plant for plant in pools[from_pool] if plant.uid not in uids]
+        for plant in movers:
+            plant.years_in_pool = 0
+            plant.pool_history.append((ctx.year, to_pool))
+        pools[to_pool].extend(movers)
+        moved |= uids
+
+    def age(self, pools, moved):
+        """Ageing: add a year to every plant in a non-frozen pool, except plants that moved in this step,
+        so years_in_pool always counts full years in the current pool.
+
+        Args:
+            pools (dict): Membership dict.
+            moved (set): uids of plants that moved earlier in this step.
+        """
+        for name in self.names:
+            if name in self.frozen:
                 continue
-            for plant in pools[pool.name]:
-                plant.years_in_pool += 1
-
-        # Walk the chain backwards (closest to production first) so nothing skips a pool in one year
-        for pool in reversed(self.pools):
-            for transition in pool.transitions:
-                movers = list(transition.select(pools[pool.name], ctx))
-                if not movers:
-                    continue
-
-                # Rebuild the source list rather than removing from it while iterating over it
-                moved = {plant.uid for plant in movers}
-                pools[pool.name] = [plant for plant in pools[pool.name] if plant.uid not in moved]
-
-                for plant in movers:
-                    plant.years_in_pool = 0
-                pools[transition.to].extend(movers)
-
-        return pools
+            for plant in pools[name]:
+                if plant.uid not in moved:
+                    plant.years_in_pool += 1
 
 
 class PoolContext:
-    def __init__(self, stage, ctx=None, year=None):
-        """What a transition rule is allowed to look at.
+    def __init__(self, stage, ctx):
+        """What a transition rule or price_path_fn is allowed to look at.
 
         Args:
             stage (MiningStage): The stage being stepped.
-            ctx (StageContext, optional): Read-only view of last year's solved chain.
-            year (int, optional): Current year.
+            ctx (StageContext): Read-only view of last year's solved chain.
         """
         self.stage = stage
         self.ctx = ctx
-        self.year = year
-        self.p_eq = stage.p_eq
-        self.pools = stage.pools
+        self.params = stage.params
+        self.year = ctx.year
+        # Last year's values for this stage, and its parent's decision price (0 for a stage with no parent)
+        self.decision_price = ctx.decision_price_of(stage.name)
+        self.production = ctx.production_of(stage.name)
+        self.parent_decision_price = 0.0 if stage.parent is None else ctx.decision_price_of(stage.parent.name)
 
     def capacity_of(self, pool_name):
-        """Total capacity sitting in one pool."""
-        return sum(plant.capacity for plant in self.pools[pool_name])
-
-    @property
-    def incentive_target(self):
-        """Capacity the incentive pool is meant to hold, from the stage's incentive ratio."""
-        return self.stage.incentive_ratio * self.capacity_of("operating")
-
-    @property
-    def supply_gap(self):
-        """How much capacity is missing to meet demand at the current price.
-
-        TODO: placeholder, replace with the real demand-minus-supply calculation.
-        """
-        return 0.0
+        """Total nameplate capacity sitting in one pool."""
+        return sum(plant.capacity for plant in self.stage.pools[pool_name])
 
 
 # ---------------------------------------------------------------------------
-# Transition rules
+# Mine economics: grade path, price path, NPV
 # ---------------------------------------------------------------------------
 
-def per_mine(predicate):
-    """Turn a one-plant-at-a-time test into a selector.
+def default_grade_fn(grade, utilisation, params):
+    """Default grade path: grade falls by params.grade_decline_rate per year of production at full
+    capacity, in proportion to how much of its capacity the mine used.
 
     Args:
-        predicate (callable): predicate(plant, ctx) -> bool.
+        grade (float): This year's grade.
+        utilisation (float): Last year's production as a fraction of nameplate capacity. It can be
+            slightly above 1, since the supply curve lets output exceed capacity when price > cost.
+        params (ModelParams): Model parameters.
 
     Returns:
-        callable: A selector suitable for a Transition.
+        float: Next year's grade.
     """
-    def select(plants, ctx):
-        return [plant for plant in plants if predicate(plant, ctx)]
-    return select
+    return grade*(1 - params.grade_decline_rate*utilisation)
 
+
+def flat_decision_price(ctx, mine, n_years):
+    """Default NPV price path: last year's decision price of the mine's stage, for every year.
+
+    Args:
+        ctx (PoolContext): Context of the mine's stage.
+        mine (Mine): Unused by the default; there so a replacement can use it.
+        n_years (int): Length of the path.
+
+    Returns:
+        array: Price in each production year.
+    """
+    return np.full(n_years, ctx.decision_price)
+
+
+def mine_npv(mine, ctx, params, price_path_fn):
+    """Net present value of deciding to open a mine now.
+
+    Years are counted from the decision year, k = 0, matching the simulation calendar: a mine that
+    passes the gate in year t produces from year t + construction_time.
+    - Capex: -capex / construction_time in each of k = 0 ... construction_time - 1 (all of it at k = 0
+      if construction_time is 0).
+    - Production: k = construction_time ... construction_time + mine_life - 1, at full capacity, with
+      cash flow (price - cost) * quantity. Capacity and cost follow the projected grade path (the
+      stage's grade_fn at utilisation 1), and cumulative production stops at the mine's reserves.
+    - Each year is discounted by (1 + discount_rate)**k.
+
+    Args:
+        mine (Mine): The mine. It is not modified.
+        ctx (PoolContext): Context of the mine's stage; ctx.stage.grade_fn gives the grade path.
+        params (ModelParams): Model parameters.
+        price_path_fn (callable): price_path_fn(ctx, mine, n_years) -> price in each production year.
+
+    Returns:
+        float: The NPV.
+    """
+    build, life = params.construction_time, params.mine_life
+
+    grades = np.empty(life)
+    grade = mine.grade
+    for j in range(life):
+        grades[j] = grade
+        grade = ctx.stage.grade_fn(grade, 1.0, params)
+
+    capacity = mine.ore_throughput*grades*mine.recovery
+    cost = mine.ore_cost/(grades*mine.recovery)
+    produced_before = np.cumsum(capacity) - capacity
+    quantity = np.clip(mine.reserves - produced_before, 0.0, capacity)
+
+    capex_years = max(build, 1)
+    cash = np.zeros(build + life)
+    cash[:capex_years] -= mine.capex/capex_years
+    cash[build:] += (price_path_fn(ctx, mine, life) - cost)*quantity
+    return float(np.sum(cash/(1 + params.discount_rate)**np.arange(build + life)))
+
+
+# ---------------------------------------------------------------------------
+# Transition rules: rule(plants, ctx) -> list of the plants that move
+# ---------------------------------------------------------------------------
 
 def after_years(n):
-    """Selector: move every plant that has spent at least n years in the pool."""
-    return per_mine(lambda plant, ctx: plant.years_in_pool >= n)
+    """Rule: every plant that has spent at least n full years in its pool."""
+    def rule(plants, ctx):
+        return [plant for plant in plants if plant.years_in_pool >= n]
+    return rule
 
 
-def cheaper_than_price(plants, ctx):
-    """PLACEHOLDER selector: move every mine whose cost sits below the current price.
-
-    TODO: swap for the NPV calculation.
-    """
-    return [plant for plant in plants if plant.cost < ctx.p_eq]
+def close_unprofitable(plants, ctx):
+    """operating -> closed: every mine whose cost this year (after depletion) exceeds last year's
+    decision price."""
+    return [mine for mine in plants if mine.cost > ctx.decision_price]
 
 
-def positive_npv(discount_rate=0.15):
-    """PLACEHOLDER selector: move every mine whose cost sits below the current price.
-    """
-
-    def npv(plant, ctx):
-        predicted_p_eq = [ctx.p_eq] * 20
-        return sum(plant.capacity * (predicted_p_eq[i] - plant.cost) / (1 + discount_rate)**(i+1) for i in range(20))
-
-    return per_mine(lambda plant, ctx: npv(plant, ctx) > 0)
+def exhausted(plants, ctx):
+    """operating -> exhausted: every mine whose reserves are used up."""
+    return [mine for mine in plants if mine.reserves <= EXHAUSTION_TOLERANCE*mine.capacity]
 
 
-def persistently_unprofitable(plants, ctx):
-    """Selector: move every mine that has been losing money for long enough to shut."""
+def positive_npv(plants, ctx):
+    """incentive -> opening: every mine with a positive NPV, with no cap. Stores npv_at_decision on
+    each mover."""
+    movers = []
+    for mine in plants:
+        npv = mine_npv(mine, ctx, ctx.params, ctx.stage.price_path_fn)
+        if npv > 0:
+            mine.npv_at_decision = npv
+            movers.append(mine)
+    return movers
+
+
+def negative_margin(plants, ctx):
+    """operating -> closed (processing): every plant whose margin at last year's decision prices is
+    negative, margin = P - (conversion_cost + intensity * P_parent). Waste streams never close."""
     return [plant for plant in plants
-            if plant.cost > ctx.p_eq and plant.years_unprofitable >= YEARS_UNPROFITABLE_THRESHOLD]
+            if not isinstance(plant, WasteStream)
+            and ctx.decision_price - (plant.conversion_cost + (plant.intensity or 0.0)*ctx.parent_decision_price) < 0]
 
 
-def fill_capacity_gap(gap_fn):
-    """Selector: take the cheapest plants until their combined capacity covers a gap.
+def fill_incentive_gap(plants, ctx):
+    """resource -> developing: the cheapest resource mines that cover the incentive gap.
 
-    Args:
-        gap_fn (callable): gap_fn(ctx) -> float, the capacity that needs filling.
+    target = incentive_ratio * last year's production of the stage (realised output, not capacity)
+    gap    = target - (K_incentive + K_developing), in nameplate capacity
 
-    Returns:
-        callable: A selector suitable for a Transition.
+    Counting developing capacity stops the same shortfall being refilled every year while earlier
+    picks are still in development.
     """
-    def select(plants, ctx):
-        gap = gap_fn(ctx)
-        if gap <= 0 or len(plants) == 0:
-            return []
-
-        ordered = sorted(plants, key=lambda plant: plant.cost)
-        capacities = np.array([plant.capacity for plant in ordered], dtype=float)
-
-        # Capacity already committed before each plant, so the one straddling the gap is included
-        committed = np.cumsum(capacities) - capacities
-        return [plant for plant, before in zip(ordered, committed) if before <= gap]
-    return select
-
-
-def default_mine_pipeline():
-    """The standard mine pipeline: resource -> developing -> incentive -> opening -> operating.
-
-    Returns:
-        MinePipeline: A fresh pipeline. Build your own and hand it to MiningStage to use a different
-        number of pools, or different rules between them.
-    """
-    return MinePipeline([
-        # TODO: placeholder rule, swap for the supply-gap calculation
-        Pool("resource", [Transition(cheaper_than_price, to="developing")]),
-        Pool("developing", [Transition(after_years(4), to="incentive")]),
-        # TODO: placeholder rule, swap for the NPV calculation
-        Pool("incentive", [Transition(positive_npv(), to="opening")]),
-        Pool("opening", [Transition(after_years(2), to="operating")]),
-        Pool("operating", [Transition(persistently_unprofitable, to="retired")]),
-        Pool("retired", frozen=True),
-    ])
+    target = ctx.params.incentive_ratio*ctx.production
+    gap = target - (ctx.capacity_of("incentive") + ctx.capacity_of("developing"))
+    return cheapest_covering(plants, gap)
 
 
 # ---------------------------------------------------------------------------
@@ -372,17 +379,22 @@ def default_mine_pipeline():
 # ---------------------------------------------------------------------------
 
 class SupplyChainStage():
-    def __init__(self, supply, demand, name):
-        """Representation of one supply chain stage.
+    def __init__(self, supply, demand, name, pipeline, pools=None):
+        """Base class for MiningStage and ProcessingStage: one supply chain stage whose plants move
+        through a pipeline of pools.
 
         Stages are mutable: the graph is built once, and every year each stage is advanced in place by
-        step(). Past years are kept as deepcopy snapshots by SupplyChain.
+        step(). Past years are kept as deepcopy snapshots by SupplyChain. The pools dict is the source
+        of truth: the supply curve mirrors pools["operating"].
 
         Args:
-            supply (callable): Supply for that stage.
+            supply (callable): Supply for that stage. Its plants become the operating pool.
             demand (callable): Demand for that stage.
             name (str): Human-readable stage name (e.g. "midstream"). Used so plants can reference
                 another stage's production by name.
+            pipeline (Pipeline): The stage's pools.
+            pools (dict, optional): Starting membership, {pool name: list of plants}, for pools other
+                than operating. Any pool left out starts empty.
         """
 
         self.supply = supply
@@ -397,59 +409,37 @@ class SupplyChainStage():
         self.decision_price = None
         self.params = None
 
+        self.pipeline = pipeline
+        self.pools = pipeline.empty_pools()
+        for pool_name, plants in (pools or {}).items():
+            if pool_name not in self.pools:
+                raise ValueError(f"Unknown pool {pool_name}; this pipeline has {pipeline.names}.")
+            self.pools[pool_name] = list(plants)
+        self.pools["operating"] = list(self.supply.plants)
+
+    def set_params(self, params):
+        """Give the stage its model parameters. Called by SupplyChain when the chain is built.
+
+        Args:
+            params (ModelParams): Model parameters.
+        """
+        self.params = params
+
     def all_pools(self):
         """Membership view used for recording.
 
-        A plain stage has no pipeline, so everything it owns is producing.
-
         Returns:
-            dict: {pool name: list of plants}.
+            dict: {pool name: list of plants}, including "operating".
         """
-        return {"operating": list(self.supply.plants)}
-
-    def step(self, ctx):
-        """Advance the stage by one year, in place.
-
-        Only reads its own state and ctx, never another live stage, so the order the stages are
-        stepped in doesn't matter.
-
-        Args:
-            ctx (StageContext): Read-only view of last year's solved chain.
-        """
-
-        if self.p_eq is None:
-            raise ValueError("Equilibrium price not set, cannot step stage.")
-
-        self._step_supply(ctx)
-        self._step_demand()
+        return dict(self.pools)
 
     def set_plants(self, plants):
-        """Replace this stage's plants, rebuilding the supply curve's cached arrays.
+        """Replace this stage's supply-curve plants, rebuilding the curve's cached arrays.
 
         Args:
-            plants (list): The stage's new full plant list.
+            plants (list): The stage's new full list of operating plants.
         """
         self.supply.set_plants(plants)
-
-    def add_plants(self, new_plants):
-        """Append plants to this stage, rebuilding the supply curve so its cached arrays stay consistent.
-
-        Args:
-            new_plants (list): Plants to add to the stage's supply.
-        """
-        self.supply.add_plants(new_plants)
-
-    def _step_supply(self, ctx):
-        """Advance every plant, follow the parent's price, then refresh the cached arrays."""
-
-        for plant in self.supply.plants:
-            plant.step(ctx)
-
-        # Total costs in a 2D curve follow the parent's price; conversion costs don't
-        if isinstance(self.supply, SupplyCurve2D) and self.parent is not None:
-            self.supply.set_upstream_price(ctx.price_of(self.parent.name))
-        else:
-            self.supply.refresh()
 
     def _step_demand(self):
         """Advance demand, in place."""
@@ -510,30 +500,32 @@ class SupplyChainStage():
 
 
 class MiningStage(SupplyChainStage):
-    def __init__(self, supply, demand, name, pipeline=None, pools=None, incentive_ratio=None,
-                 incentive_pool=None, resource_pool=None):
-        """Subtype of a SupplyChainStage whose plants move through a chain of pools.
+    POOLS = ("resource", "developing", "incentive", "opening", "operating", "closed", "exhausted")
 
-        The pools dict is the source of truth: the supply curve is rebuilt from pools["operating"] at
-        the end of every step.
+    def __init__(self, supply, demand, name, capex_intensity=None, pools=None, incentive_pool=None,
+                 resource_pool=None, grade_fn=default_grade_fn, price_path_fn=flat_decision_price):
+        """Subtype of a SupplyChainStage whose mines move through a chain of pools.
+
+        Pools, upstream first: resource -> developing -> incentive -> opening -> operating -> closed,
+        plus a frozen exhausted pool. The pools dict is the source of truth: the supply curve is
+        rebuilt from pools["operating"] at the end of every step.
 
         Args:
             supply (callable): Supply for that stage. Its plants become the operating pool.
             demand (callable): Demand for that stage.
             name (str): Human-readable stage name.
-            pipeline (MinePipeline, optional): The pools and the rules between them.
-                Defaults to default_mine_pipeline().
+            capex_intensity (float, optional): Capex per unit of annual capacity, the same for every mine
+                in the stage. Sets the capex of every mine that has none; required unless every mine
+                has its own.
             pools (dict, optional): Starting membership, {pool name: list of mines}. Any pool left out
-                starts empty. Keys must be pool names that exist in the pipeline.
-            incentive_ratio (float, optional): Capacity the incentive pool should hold, as a fraction of
-                operating capacity. Defaults to whatever ratio the starting pools happen to have.
+                starts empty.
             incentive_pool (list, optional): Shorthand for pools={"incentive": ...}.
             resource_pool (list, optional): Shorthand for pools={"resource": ...}.
+            grade_fn (callable, optional): grade_fn(grade, utilisation, params) -> next year's grade of
+                a mine that produced at the given utilisation. Defaults to default_grade_fn.
+            price_path_fn (callable, optional): price_path_fn(ctx, mine, n_years) -> expected price in
+                each production year, used in the NPV. Defaults to flat_decision_price.
         """
-
-        super().__init__(supply, demand, name)
-
-        self.pipeline = pipeline if pipeline is not None else default_mine_pipeline()
 
         # The two shorthands are just entries in the same starting-membership dict
         starting = dict(pools or {})
@@ -541,18 +533,19 @@ class MiningStage(SupplyChainStage):
             starting["incentive"] = incentive_pool
         if resource_pool is not None:
             starting["resource"] = resource_pool
+        super().__init__(supply, demand, name, Pipeline(self.POOLS, frozen=("exhausted",)), starting)
 
-        self.pools = self.pipeline.empty_pools()
-        for pool_name, mines in starting.items():
-            if pool_name not in self.pools:
-                raise ValueError(f"Unknown pool {pool_name}; this pipeline has {self.pipeline.names}.")
-            self.pools[pool_name] = list(mines)
+        self.grade_fn = grade_fn
+        self.price_path_fn = price_path_fn
+        self.capex_intensity = capex_intensity
 
-        # The supply curve's plants are the operating pool, always
-        self.pools["operating"] = list(self.supply.plants)
-
-        self.incentive_ratio = (incentive_ratio if incentive_ratio is not None
-                                else self._measure_incentive_ratio())
+        # Capex is set once, here, and never recomputed
+        for mines in self.pools.values():
+            for mine in mines:
+                if mine.capex is None:
+                    if capex_intensity is None:
+                        raise ValueError(f"Stage {name!r} needs a capex_intensity: mine {mine.uid} has no capex.")
+                    mine.capex = capex_intensity*mine.capacity
 
     # Convenience read-only access, so stage.incentive_pool and friends still work
     @property
@@ -576,16 +569,29 @@ class MiningStage(SupplyChainStage):
         return self.pools["operating"]
 
     @property
-    def retired_pool(self):
-        return self.pools["retired"]
+    def closed_pool(self):
+        return self.pools["closed"]
 
-    def all_pools(self):
-        """Membership view used for recording.
+    @property
+    def exhausted_pool(self):
+        return self.pools["exhausted"]
 
-        Returns:
-            dict: {pool name: list of mines}, including "operating".
+    def set_params(self, params):
+        """Give the stage its model parameters, and fill in the reserves of mines that have none
+        (params.default_reserve_life years of capacity).
+
+        Args:
+            params (ModelParams): Model parameters.
         """
-        return dict(self.pools)
+        super().set_params(params)
+        if params.closed_destination not in self.pools:
+            raise ValueError(f"closed_destination {params.closed_destination!r} is not one of {self.pipeline.names}.")
+
+        for mines in self.pools.values():
+            for mine in mines:
+                if mine.reserves is None:
+                    mine.reserves = params.default_reserve_life*mine.capacity
+        self.set_plants(self.pools["operating"])
 
     def add_plants(self, new_plants):
         """Add mines straight into production.
@@ -597,10 +603,23 @@ class MiningStage(SupplyChainStage):
         self.set_plants(self.pools["operating"])
 
     def step(self, ctx):
-        """Advance the stage by one year, in place.
+        """Advance the stage by one year, in place. Every decision uses last year's values, and prices
+        are the decision price (smoothed equilibrium price).
 
-        Order matters: every mine ages first, then we work out who is losing money, then mines move
-        between pools, then the supply curve is rebuilt from whoever ended up operating.
+        1. Depletion of every mine that was operating last year (_deplete).
+        2. operating -> exhausted: reserves used up (exhausted).
+        3. operating -> closed: cost after depletion above the decision price (close_unprofitable).
+        4. Ageing of every mine that hasn't moved this step (Pipeline.age).
+        5. opening -> operating after construction_time years.
+        6. incentive -> opening: positive NPV (positive_npv).
+        7. developing -> incentive after feasibility_time years.
+        8. closed -> closed_destination after closed_cooldown years.
+        9. resource -> developing: greedy fill of the incentive gap (fill_incentive_gap).
+        10. The supply curve is rebuilt from the operating pool.
+
+        A mine moves at most once per step. The minimum lead time from resource to operating is
+        feasibility_time + 1 + construction_time years: a mine that reaches incentive in step 7 can
+        first pass the NPV gate in step 6 of the following year.
 
         Args:
             ctx (StageContext): Read-only view of last year's solved chain.
@@ -609,38 +628,156 @@ class MiningStage(SupplyChainStage):
         if self.p_eq is None:
             raise ValueError("Equilibrium price not set, cannot step stage.")
 
-        for pool_name, mines in self.pools.items():
-            if self.pipeline.pool(pool_name).frozen:
-                continue
-            for mine in mines:
-                mine.step(ctx, self.params, pool=pool_name)
-
-        self._update_profitability()
-
-        self.pipeline.step(self.pools, PoolContext(self, ctx=ctx))
+        params = self.params
+        pool_ctx = PoolContext(self, ctx)
+        moved = set()
+        self._deplete(self.pools["operating"], ctx)
+        self.pipeline.move(self.pools, "operating", "exhausted", exhausted, pool_ctx, moved)
+        self.pipeline.move(self.pools, "operating", "closed", close_unprofitable, pool_ctx, moved)
+        self.pipeline.age(self.pools, moved)
+        self.pipeline.move(self.pools, "opening", "operating", after_years(params.construction_time),
+                           pool_ctx, moved)
+        self.pipeline.move(self.pools, "incentive", "opening", positive_npv, pool_ctx, moved)
+        self.pipeline.move(self.pools, "developing", "incentive", after_years(params.feasibility_time),
+                           pool_ctx, moved)
+        self.pipeline.move(self.pools, "closed", params.closed_destination, after_years(params.closed_cooldown),
+                           pool_ctx, moved)
+        self.pipeline.move(self.pools, "resource", "developing", fill_incentive_gap, pool_ctx, moved)
 
         # pools["operating"] is the truth, the supply curve just mirrors it
         self.set_plants(self.pools["operating"])
 
         self._step_demand()
 
-    def _update_profitability(self):
-        """Count how long each operating mine has been under water, resetting when it recovers.
+    def _deplete(self, mines, ctx):
+        """Depletion: each mine loses last year's production from its reserves, and its grade moves
+        along grade_fn at last year's utilisation (production / nameplate capacity).
 
-        TODO: this is the simplest possible rule, change it if you want a smarter one.
+        Args:
+            mines (list): The mines that were operating last year.
+            ctx (StageContext): Read-only view of last year's solved chain.
         """
-        for mine in self.pools["operating"]:
-            if mine.cost > self.p_eq:
-                mine.years_unprofitable += 1
-            else:
-                mine.years_unprofitable = 0
+        for mine in mines:
+            produced = ctx.consumed_by(mine)
+            mine.reserves = max(mine.reserves - produced, 0.0)
+            mine.grade = self.grade_fn(mine.grade, produced/mine.capacity, self.params)
 
-    def _measure_incentive_ratio(self):
-        """Incentive pool capacity as a fraction of operating capacity.
 
-        Zero if this pipeline has no pool called "incentive", which a custom one need not.
+class ProcessingStage(SupplyChainStage):
+    POOLS = ("construction", "operating", "closed")
+
+    def __init__(self, supply, demand, name, pools=None):
+        """Subtype of a SupplyChainStage for processing plants, which are replicable: pools are
+        construction -> operating -> closed, and closed is frozen (plants never re-enter).
+
+        Waste streams sit in operating for good: they never close or expand, but they follow the
+        learning rule and count in the expansion utilisation.
+
+        Args:
+            supply (callable): Supply for that stage. Its plants become the operating pool.
+            demand (callable): Demand for that stage.
+            name (str): Human-readable stage name.
+            pools (dict, optional): Starting membership for "construction" or "closed",
+                {pool name: list of plants}.
         """
-        operating_capacity = self.supply.capacities.sum()
-        if operating_capacity <= 0 or "incentive" not in self.pools:
-            return 0.0
-        return sum(mine.capacity for mine in self.pools["incentive"]) / operating_capacity
+        super().__init__(supply, demand, name, Pipeline(self.POOLS, frozen=("closed",)), pools)
+
+    def add_plants(self, new_plants):
+        """Add plants straight into production, with costs quoted at the stage's current upstream price.
+
+        Args:
+            new_plants (list): Plants to add to the operating pool.
+        """
+        self.supply.add_plants(new_plants)
+        self.pools["operating"] = list(self.supply.plants)
+
+    def step(self, ctx):
+        """Advance the stage by one year, in place. Decisions use last year's decision prices.
+
+        1. operating -> closed: negative margin (negative_margin).
+        2. Learning on every construction and operating plant (_learn).
+        3. Ageing of every plant that hasn't moved this step (Pipeline.age).
+        4. construction -> operating after plant_construction_time years.
+        5. Expansion with template plants (_expand), measured against last year's pools.
+        6. Waste-stream capacities from their source flows (WasteStream.step).
+        7. The supply curve is rebuilt from the operating pool, at last year's parent price.
+
+        Args:
+            ctx (StageContext): Read-only view of last year's solved chain.
+        """
+        if self.p_eq is None:
+            raise ValueError("Equilibrium price not set, cannot step stage.")
+
+        params = self.params
+        pool_ctx = PoolContext(self, ctx)
+        moved = set()
+        # Last year's pools, before any move or learning: expansion is measured against them
+        last_operating = sum(plant.capacity for plant in self.pools["operating"])
+        last_construction = sum(plant.capacity for plant in self.pools["construction"])
+        last_regular = [(plant.capacity, plant.conversion_cost) for plant in self.pools["operating"]
+                        if not isinstance(plant, WasteStream)]
+
+        self.pipeline.move(self.pools, "operating", "closed", negative_margin, pool_ctx, moved)
+        self._learn()
+        self.pipeline.age(self.pools, moved)
+        self.pipeline.move(self.pools, "construction", "operating", after_years(params.plant_construction_time),
+                           pool_ctx, moved)
+        self._expand(pool_ctx, last_operating, last_construction, last_regular)
+
+        for plant in self.pools["operating"]:
+            if isinstance(plant, WasteStream):
+                plant.step(ctx)
+
+        self.set_plants(self.pools["operating"])
+        if isinstance(self.supply, SupplyCurve2D) and self.parent is not None:
+            self.supply.set_upstream_price(ctx.price_of(self.parent.name))
+
+        self._step_demand()
+
+    def _learn(self):
+        """Learning: conversion cost falls by plant_learning_rate for every plant in construction or
+        operating, waste streams included."""
+        for name in ("construction", "operating"):
+            for plant in self.pools[name]:
+                plant.conversion_cost *= (1 - self.params.plant_learning_rate)
+
+    def _expand(self, ctx, last_operating, last_construction, last_regular):
+        """Expansion: build template plants into construction when last year's plants ran close to full
+        and a new plant would make money. Everything is measured on last year's pools.
+
+        utilisation = production last year / operating capacity last year (waste streams included)
+        Builds only if utilisation > expansion_utilisation_threshold and the template plant's margin at
+        last year's decision prices is positive. Then adds template plants until they cover
+            required = production / expansion_target_utilisation - (operating + construction capacity last year)
+        including the plant that crosses it.
+
+        A template plant copies last year's regular (non-waste) operating plants: median capacity,
+        conversion cost at the expansion_cost_percentile percentile, the stage's intensity,
+        synthetic=True.
+
+        Args:
+            ctx (PoolContext): Context of this stage.
+            last_operating (float): Operating capacity during last year's solve.
+            last_construction (float): Construction capacity during last year's solve.
+            last_regular (list): (capacity, conversion cost) of last year's regular operating plants.
+        """
+        params = self.params
+        if last_operating <= 0 or not last_regular:
+            return
+        if ctx.production/last_operating <= params.expansion_utilisation_threshold:
+            return
+
+        intensity = getattr(self.supply, "intensity", None) or 0.0
+        capacities, conversion_costs = np.array(last_regular, dtype=float).T
+        capacity = float(np.median(capacities))
+        conversion_cost = float(np.percentile(conversion_costs, params.expansion_cost_percentile))
+        if ctx.decision_price - (conversion_cost + intensity*ctx.parent_decision_price) <= 0:
+            return
+
+        required = ctx.production/params.expansion_target_utilisation - (last_operating + last_construction)
+        if required <= 0 or capacity <= 0:
+            return
+        for _ in range(int(np.ceil(required/capacity))):
+            plant = SupplyPlant(capacity, conversion_cost, intensity=intensity, synthetic=True)
+            plant.pool_history.append((ctx.year, "construction"))
+            self.pools["construction"].append(plant)
