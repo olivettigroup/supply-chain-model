@@ -1,11 +1,32 @@
 import copy
+import warnings
+from dataclasses import dataclass
 
-from .utils import build_chain, solve_chain, SupplyCurve2D
+import numpy as np
+
+from .utils import build_chain, solve_chain, SupplyCurve2D, MIN_COST_FACTOR
 from .supply_chain_stages import MiningStage
 
 
+@dataclass(frozen=True)
+class ModelParams:
+    """Global model parameters. Values that differ by stage are stage attributes, not parameters.
+
+    Attributes:
+        start_year (int): First model year.
+        end_year (int): Last model year.
+        price_smoothing_weight (float): Weight on this year's equilibrium price in the decision price.
+            1 switches smoothing off.
+        grade_decline_rate (float): Annual ore-grade decline of mines.
+    """
+    start_year: int = 2024
+    end_year: int = 2050
+    price_smoothing_weight: float = 0.34
+    grade_decline_rate: float = 0.01
+
+
 class SupplyChain:
-    def __init__(self, input_stages, initial_year=2026, verbosity=0):
+    def __init__(self, input_stages, params=None, verbosity=0):
         """Simulates a supply chain with various supply stages througout time.
 
         The stages are mutable and advanced in place each year. The input stages are deepcopied on the
@@ -14,15 +35,17 @@ class SupplyChain:
 
         Args:
             input_stages (array): List of SupplyChainStages
-            initial_year (int, optional): Year to start simulations for. Defaults to 2026.
+            params (ModelParams, optional): Model parameters. Defaults to ModelParams().
             verbosity (int, optional): Print the year as it runs if above 0. Defaults to 0.
         """
         # One deepcopy call over the whole list, so the copies share one memo and the graph
         # (parent links, CompositeDemand children) stays wired up inside the copy
         own_stages = copy.deepcopy(list(input_stages))
 
+        self.params = params if params is not None else ModelParams()
         self.stages, self.parent, self.children = build_chain(own_stages[0])
-        self.initial_year = initial_year
+        for stage in self.stages:
+            stage.params = self.params
         self.mine_idx = [k for k, s in enumerate(self.stages) if isinstance(s, MiningStage)]
         self.plant_idx = [k for k, s in enumerate(self.stages) if not isinstance(s, MiningStage)]
 
@@ -89,12 +112,17 @@ class SupplyChain:
         return pd.DataFrame(self.records)
 
     def prices_df(self):
-        """The equilibrium prices as a DataFrame indexed by year, one column per stage."""
+        """Prices as a DataFrame indexed by year: one column per stage with the equilibrium price,
+        then one "<stage> (decision)" column per stage with the decision price."""
         import pandas as pd
         return pd.DataFrame.from_dict(self.prices, orient="index").rename_axis("year")
 
     def solve_prices(self):
-        """Solve for the equilibrium prices of the live stages and write them onto the stages."""
+        """Solve for the equilibrium prices of the live stages and write them onto the stages.
+
+        Warns if the MIN_COST_FACTOR cost floor binds at the solved prices, since the floor is only
+        meant to keep the solver's trial prices well defined.
+        """
 
         empty = [s.name for s in self.stages if len(s.supply.plants) == 0]
         if empty:
@@ -112,17 +140,38 @@ class SupplyChain:
         for node, pi in res.items():
             node.p_eq = pi
 
-    def run(self, n_iterations, scenario=None):
-        """Run the supply chain simulation for a given number of iterations (years).
+        for s in self.stages:
+            if isinstance(s.supply, SupplyCurve2D) and s.parent is not None:
+                unfloored = s.supply.conversion_costs + s.supply.plant_intensities*s.parent.p_eq
+                n_floored = int(np.sum(unfloored < MIN_COST_FACTOR*s.supply.costs))
+                if n_floored:
+                    warnings.warn(f"{self._current_year}: the MIN_COST_FACTOR cost floor binds for "
+                                  f"{n_floored} plant(s) of stage {s.name!r} at the solved prices.")
+
+    def _smooth_decision_prices(self):
+        """Update every stage's decision price from the price just solved.
+
+        P̄_t = w * p_eq_t + (1 - w) * P̄_{t-1}, with w = params.price_smoothing_weight. In the first year
+        the decision price is p_eq.
+        """
+        w = self.params.price_smoothing_weight
+        for s in self.stages:
+            s.decision_price = s.p_eq if s.decision_price is None else w*s.p_eq + (1 - w)*s.decision_price
+
+    def run(self, n_iterations=None, scenario=None):
+        """Run the supply chain simulation from params.start_year.
 
         Args:
-            n_iterations (int): Number of years to simulate after the initial one.
+            n_iterations (int, optional): Number of years to simulate after the initial one. Defaults to
+                running through params.end_year.
             scenario (callable, optional): Scenario callback ``scenario(chain, t)`` invoked each year after that
                 year's stages are built but before prices are solved. Defaults to None (baseline run).
         """
+        if n_iterations is None:
+            n_iterations = self.params.end_year - self.params.start_year
 
         for i in range(n_iterations + 1):
-            t = self.initial_year + i
+            t = self.params.start_year + i
             self._current_year = t
             if self.verbosity > 0: print(f"Year {t}")
 
@@ -139,6 +188,7 @@ class SupplyChain:
                 scenario(self, t)
 
             self.solve_prices()
+            self._smooth_decision_prices()
 
             # Freeze the year: one deepcopy call so the snapshot's internal graph stays consistent
             self.stages_history[t] = copy.deepcopy(self.stages)
@@ -151,6 +201,7 @@ class SupplyChain:
             t (int): Year being recorded.
         """
         self.prices[t] = {s.name: s.p_eq for s in self.stages}
+        self.prices[t].update({f"{s.name} (decision)": s.decision_price for s in self.stages})
 
         for stage in self.stages:
             produced = {p.uid: float(q) for p, q in
@@ -208,6 +259,7 @@ class StageContext:
             stages (list): The current year's solved SupplyChainStages (each with p_eq set).
         """
         self._prices = {s.name: s.p_eq for s in stages}
+        self._decision_prices = {s.name: s.decision_price for s in stages}
 
         # Per-plant realized output at equilibrium, and which stage each plant belongs to, keyed by uid
         self._production = {}
@@ -223,6 +275,10 @@ class StageContext:
     def price_of(self, name):
         """This year's equilibrium price of the named stage."""
         return self._prices[name]
+
+    def decision_price_of(self, name):
+        """This year's decision price (smoothed equilibrium price) of the named stage."""
+        return self._decision_prices[name]
 
     def production_of(self, name):
         """This year's total production of the named stage."""

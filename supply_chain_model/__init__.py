@@ -5,7 +5,7 @@ The classes and functions needed to build and run a chain are importable from th
 e.g. ``from supply_chain_model import SupplyChain``. Everything else stays in its submodule.
 """
 
-from .supply_chain import SupplyChain, StageContext
+from .supply_chain import ModelParams, SupplyChain, StageContext
 from .supply_chain_stages import (
     SupplyPlant, Mine, WasteStream,
     SupplyChainStage, MiningStage,
@@ -15,7 +15,7 @@ from .supply_chain_stages import (
 from .utils import SupplyCurve, SupplyCurve2D, DemandCurve, CompositeDemand, generate_cost_curve
 
 __all__ = [
-    "SupplyChain", "StageContext",
+    "ModelParams", "SupplyChain", "StageContext",
     "SupplyPlant", "Mine", "WasteStream",
     "SupplyChainStage", "MiningStage",
     "Transition", "Pool", "MinePipeline", "PoolContext", "default_mine_pipeline",

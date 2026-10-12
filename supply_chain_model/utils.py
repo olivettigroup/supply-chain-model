@@ -10,9 +10,10 @@ MINE_DISTRIBUTION_COST_MIN = 0.0647
 MIN_PRICE_FACTOR = 0.95
 SHARPNESS = 500
 
-# A plant's cost can never fall below this fraction of its reference cost, however low the upstream
-# price goes. Without a floor, costs_for_p_u can go negative (whenever min_costs is negative and the
-# solver probes a low upstream price) and the curve returns nan.
+# Numerical guard only: a plant's total cost can never fall below this fraction of its cost at last
+# year's upstream price, however low an upstream price the solver probes. Without it, a plant with a
+# negative conversion cost would get a negative total cost and the curve would return nan.
+# SupplyChain.solve_prices warns if it binds at a solved price.
 MIN_COST_FACTOR = 0.05
 
 def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000)):
@@ -43,6 +44,26 @@ def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000)):
 
     return samples[:, 0]*total_capacity/samples[:, 0].sum(), samples[:, 1]
 
+def plant_quantities(p, capacities, costs, eta):
+    """Per-plant quantities supplied at the given price(s): the plant supply response.
+
+    Each plant switches on steeply around MIN_PRICE_FACTOR * its cost (a logistic with SHARPNESS),
+    and above that supplies capacity * (p / cost)**eta, scaled so it supplies its capacity at p = cost.
+
+    Args:
+        p (array): Prices to evaluate at.
+        capacities (array): Capacity of each plant.
+        costs (array): Total cost of each plant.
+        eta (float): Elasticity of each plant's marginal price curve.
+
+    Returns:
+        array: Quantities per plant, shape (len(p), n_plants).
+    """
+    p_arr = np.atleast_1d(np.asarray(p, dtype=float))[:, np.newaxis]
+    l = lambda x: 1.0 / (1.0 + np.exp(-SHARPNESS * (x / (MIN_PRICE_FACTOR * costs) - 1.0)))
+    A = capacities / (l(costs) * costs ** eta)
+    return l(p_arr) * A * p_arr ** eta  # (m, n_plants)
+
 class SupplyCurve:
     def __init__(self, plants, eta=0.1):
         """Basic supply curve composed of a horizontal sum of marginal price curves.
@@ -50,7 +71,6 @@ class SupplyCurve:
         Args:
             plants (list): List of supply plants.
             eta (float, optional): Elasticity for the marginal price curves. Defaults to 0.1.
-            min_price (float, optional): Price floor for the marginal price curves. Defaults to 0.95.
         """
         self.eta = eta
         self.set_plants(plants)
@@ -82,10 +102,7 @@ class SupplyCurve:
         Returns:
             array: Quantities per plant, shape (len(p), n_plants).
         """
-        p_arr = np.atleast_1d(np.asarray(p, dtype=float))[:, np.newaxis]
-        l = lambda x: 1.0 / (1.0 + np.exp(-SHARPNESS * (x / (MIN_PRICE_FACTOR * self.costs) - 1.0)))
-        A = self.capacities / (l(self.costs) * self.costs ** self.eta)
-        return l(p_arr) * A * p_arr ** self.eta  # (m, n_plants)
+        return plant_quantities(p, self.capacities, self.costs, self.eta)
 
     def __call__(self, p):
         """Evaluation of the supply curve.
@@ -104,55 +121,81 @@ class SupplyCurve2D():
     def __init__(self, plants, intensity, p_u_ref, eta=0.1):
         """Supply curve with changing upstream price.
 
+        Each plant's primitive cost is its conversion cost (non-material cost per unit of output). Its
+        total cost at upstream price p_u is conversion_cost + intensity * p_u.
+
         Args:
-            plants (list): List of supply plants.
-            intensity (float): Default upstream input required per unit output, for plants that don't set their own (plant.intensity is None).
-            p_u_ref (float): Reference price at which the costs are defined.
+            plants (list): List of supply plants. Their cost is the total cost quoted at p_u_ref.
+            intensity (float): Default upstream input required per unit output, for plants that don't
+                set their own (plant.intensity is None).
+            p_u_ref (float): Upstream price the plants' costs are quoted at. Only used here, to split
+                each total cost into conversion cost and input cost.
             eta (float, optional): Elasticity for the marginal price curves. Defaults to 0.1.
-            min_price (float, optional): Price floor for the marginal price curves. Defaults to 0.95.
         """
         self.intensity = intensity
-        self.p_u_ref = p_u_ref
+        # Last year's upstream price; the stage moves it with the parent's price every year
+        self.p_u = p_u_ref
         self.eta = eta
         self.set_plants(plants)
 
     def refresh(self):
-        """Recompute the cached arrays from the current plants and p_u_ref.
+        """Recompute the cached arrays from the current plants and upstream price.
 
-        The plants are mutated in place every year and p_u_ref moves with the parent's
-        price, so every array derived from them has to be rebuilt afterwards.
+        The plants are mutated in place every year, so every array derived from them has to be
+        rebuilt afterwards.
         """
         self.capacities = np.array([plant.capacity for plant in self.plants], dtype=float)
-        self.costs = np.array([plant.cost for plant in self.plants], dtype=float)
-        self.plant_intensities = np.array([self.intensity if plant.intensity is None else plant.intensity
-                                           for plant in self.plants], dtype=float)
-        self.min_costs = self.costs - self.plant_intensities*self.p_u_ref
+        self.conversion_costs = np.array([plant.conversion_cost for plant in self.plants], dtype=float)
+        self.plant_intensities = np.array([plant.intensity for plant in self.plants], dtype=float)
+        self.costs = self.conversion_costs + self.plant_intensities*self.p_u
 
     def set_plants(self, plants):
-        """Replace the plant list and refresh the cached arrays."""
+        """Replace the plant list and refresh the cached arrays.
+
+        Each plant's current total cost is taken as quoted at this curve's upstream price and split
+        into conversion cost and input cost on that basis. For plants already on the curve this
+        changes nothing, since their total cost is already at that price.
+        """
         self.plants = np.array(list(plants), dtype=object)
+        for plant in self.plants:
+            if plant.intensity is None:
+                plant.intensity = self.intensity
+            plant.conversion_cost = plant.cost - plant.intensity*self.p_u
+            plant.upstream_price = self.p_u
         self.refresh()
 
     def add_plants(self, new_plants):
-        """Append plants and refresh the cached arrays."""
+        """Append plants and refresh the cached arrays. New plants' costs are quoted at the curve's
+        current upstream price."""
         self.set_plants(list(self.plants) + list(new_plants))
+
+    def set_upstream_price(self, p_u):
+        """Move the curve and its plants to a new upstream price. Conversion costs are unchanged.
+
+        Args:
+            p_u (float): The new upstream price (last year's parent price).
+        """
+        self.p_u = p_u
+        for plant in self.plants:
+            plant.upstream_price = p_u
+        self.refresh()
 
     def costs_at(self, p_u=None):
         """Per-plant total cost at a given upstream price.
 
-        Floored at MIN_COST_FACTOR of the reference cost so the curve stays defined (and positive)
-        even when the solver probes an upstream price far below p_u_ref.
+        Floored at MIN_COST_FACTOR of the cost at the curve's own upstream price, so the curve stays
+        defined (and positive) even when the solver probes a very low upstream price.
 
         Args:
-            p_u (float, optional): Upstream price. Defaults to p_u_ref.
+            p_u (float, optional): Upstream price. Defaults to the curve's upstream price.
 
         Returns:
             array: Cost of each plant.
         """
         if p_u is None:
-            p_u = self.p_u_ref
+            p_u = self.p_u
 
-        return np.maximum(self.plant_intensities*p_u + self.min_costs, MIN_COST_FACTOR*self.costs)
+        return np.maximum(self.conversion_costs + self.plant_intensities*p_u, MIN_COST_FACTOR*self.costs)
 
     def _plant_quantities(self, p_d, p_u=None):
         """Per-plant quantities supplied at the given price(s).
@@ -164,12 +207,7 @@ class SupplyCurve2D():
         Returns:
             array: Quantities per plant, shape (len(p_d), n_plants).
         """
-        costs_for_p_u = self.costs_at(p_u)
-
-        p_arr = np.atleast_1d(np.asarray(p_d, dtype=float))[:, np.newaxis]
-        l = lambda x: 1.0 / (1.0 + np.exp(-SHARPNESS * (x / (MIN_PRICE_FACTOR * costs_for_p_u) - 1.0)))
-        A = self.capacities / (l(costs_for_p_u) * costs_for_p_u ** self.eta)
-        return l(p_arr) * A * p_arr ** self.eta  # (m, n_plants)
+        return plant_quantities(p_d, self.capacities, self.costs_at(p_u), self.eta)
 
     def __call__(self, p_d, p_u=None):
         """Evaluation of the supply curve.
@@ -346,8 +384,8 @@ def _residuals(logp, nodes, parent, children):
         if isinstance(node.demand, CompositeDemand):
             D = node.demand.other + sum(nodes[c].supply.upstream_demand(p[c], p[i]) for c in children[i])
         else:
-            D = node.demand.A * p[i] ** node.demand.elas
-        
+            D = node.demand(p[i])
+
         # No matter the demand, subtract the supply and scale it for better convergence
         res[i] = (S[i] - D) / scale[i]
     
@@ -366,8 +404,14 @@ def solve_chain(nodes, parent, children, p0=None):
         dict: Dictionnary with SupplyChainStages as keys and their equilibrium prices as values.
     """
     
-    # Prices can't sit below cheapest plant
-    lb = np.log(np.array([n.supply.costs.min() * 0.5 for n in nodes]))  
+    # A price can't sit far below the stage's cheapest plant. For a child, take the cheapest cost at
+    # the parent's own lower bound, so the bound holds however far the parent's price falls this year.
+    # nodes lists every parent before its children, so the parent's bound is always ready.
+    lb = np.empty(len(nodes))
+    for i, n in enumerate(nodes):
+        costs = n.supply.costs if parent[i] < 0 else n.supply.costs_at(lb[parent[i]])
+        lb[i] = 0.5 * costs.min()
+    lb = np.log(lb)
     
     # Get x0 as log or create it from the means. Passing last year's prices matters once the chain
     # has run for a while: the cost means can sit far enough from the answer that the solver starts

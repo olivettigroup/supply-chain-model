@@ -5,6 +5,7 @@ import numpy as np
 from .utils import CompositeDemand, SupplyCurve2D, find_intersection
 
 YEARS_UNPROFITABLE_THRESHOLD = 3
+# Annual escalation of processing-plant and waste-stream conversion costs, and annual leaf demand growth
 CHANGE = 0.01
 
 
@@ -15,17 +16,28 @@ class SupplyPlant:
     def __init__(self, capacity, cost, intensity=None, uid=None):
         """Generic type for a plant that produces a material.
 
+        The plant's primitive cost is its conversion cost, the non-material cost per unit of output.
+        Its total cost (the cost property) adds the upstream input at last year's upstream price. A
+        plant with no upstream input (upstream_price = 0) has total cost = conversion cost.
+
         Args:
             capacity (float): Avaialble capacity.
-            cost (float): Marginal cost
+            cost (float): Total marginal cost. A SupplyCurve2D takes it as quoted at the curve's upstream
+                price and splits it into conversion cost and input cost when the plant joins.
             intensity (float, optional): How much of the upstream material is needed for production. Defaults to None.
             uid (int, optional): Stable identifier, kept for the plant's whole life so it can be tracked
                 across years in the chain's records. Defaults to the next value of the shared counter.
         """
         self.uid = next(SupplyPlant._uid_counter) if uid is None else uid
         self.capacity = capacity
-        self.cost = cost
         self.intensity = intensity
+        self.conversion_cost = cost
+        self.upstream_price = 0.0
+
+    @property
+    def cost(self):
+        """Total cost per unit of output, at last year's upstream price."""
+        return self.conversion_cost + (self.intensity or 0.0)*self.upstream_price
 
     @classmethod
     def reset_uids(cls):
@@ -39,7 +51,7 @@ class SupplyPlant:
             ctx (StageContext): Read-only view of last year's solved chain.
             pool (str): Name of the pool the plant currently sits in.
         """
-        self.cost /= (1 - CHANGE)
+        self.conversion_cost /= (1 - CHANGE)
 
 
 class Mine(SupplyPlant):
@@ -59,17 +71,24 @@ class Mine(SupplyPlant):
         self.years_unprofitable = years_unprofitable
         self.years_in_pool = years_in_pool
 
-    def step(self, ctx, pool="operating"):
-        """Advance this mine by one year, in place.
+    def step(self, ctx, params, pool="operating"):
+        """Advance this mine by one year, in place: grade decline raises its cost, and lowers its
+        capacity if it is operating.
 
         years_in_pool is deliberately not touched here: MinePipeline.step owns the ageing so there is
         exactly one place where it happens, for every pool at once.
+
+        Args:
+            ctx (StageContext): Read-only view of last year's solved chain.
+            params (ModelParams): Model parameters; uses grade_decline_rate.
+            pool (str): Name of the pool the mine currently sits in.
         """
-        self.cost /= (1 - CHANGE)
+        # A mine has no upstream input, so its conversion cost is its whole cost
+        self.conversion_cost /= (1 - params.grade_decline_rate)
 
         # Only a producing mine depletes its reserves
         if pool == "operating":
-            self.capacity *= (1 - CHANGE)
+            self.capacity *= (1 - params.grade_decline_rate)
 
 
 class WasteStream(SupplyPlant):
@@ -106,7 +125,7 @@ class WasteStream(SupplyPlant):
         else:
             self.capacity = inflow
 
-        self.cost /= (1 - CHANGE)
+        self.conversion_cost /= (1 - CHANGE)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +393,9 @@ class SupplyChainStage():
             for downstream in demand.downstreams:
                 downstream.parent = self
         self.p_eq = None
+        # Set by SupplyChain: the smoothed price supply decisions respond to, and the model parameters
+        self.decision_price = None
+        self.params = None
 
     def all_pools(self):
         """Membership view used for recording.
@@ -423,11 +445,11 @@ class SupplyChainStage():
         for plant in self.supply.plants:
             plant.step(ctx)
 
-        # The costs in a 2D curve are quoted against an upstream reference price that moves each year
+        # Total costs in a 2D curve follow the parent's price; conversion costs don't
         if isinstance(self.supply, SupplyCurve2D) and self.parent is not None:
-            self.supply.p_u_ref = ctx.price_of(self.parent.name)
-
-        self.supply.refresh()
+            self.supply.set_upstream_price(ctx.price_of(self.parent.name))
+        else:
+            self.supply.refresh()
 
     def _step_demand(self):
         """Advance demand, in place."""
@@ -591,7 +613,7 @@ class MiningStage(SupplyChainStage):
             if self.pipeline.pool(pool_name).frozen:
                 continue
             for mine in mines:
-                mine.step(ctx, pool=pool_name)
+                mine.step(ctx, self.params, pool=pool_name)
 
         self._update_profitability()
 
