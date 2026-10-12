@@ -1,7 +1,7 @@
 import copy
 
-from utils import build_chain, solve_chain, SupplyCurve2D
-from supply_chain_stages import MiningStage
+from .utils import build_chain, solve_chain, SupplyCurve2D
+from .supply_chain_stages import MiningStage
 
 
 class SupplyChain:

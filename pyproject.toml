@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supply_chain_model"
+version = "0.3.0"
+description = "MIT's supply chain model"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+]
+
+[tool.setuptools.packages.find]
+include = ["supply_chain_model*"]

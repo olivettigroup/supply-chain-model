@@ -2,7 +2,7 @@ import itertools
 
 import numpy as np
 
-from utils import CompositeDemand, SupplyCurve2D, find_intersection
+from .utils import CompositeDemand, SupplyCurve2D, find_intersection
 
 YEARS_UNPROFITABLE_THRESHOLD = 3
 CHANGE = 0.01

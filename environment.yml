@@ -1,0 +1,11 @@
+name: supply_chain_model
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy=2
+  - scipy=1
+  - pandas=3
+  - matplotlib=3
+  - ipykernel
