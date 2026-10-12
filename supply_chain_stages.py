@@ -289,6 +289,17 @@ def cheaper_than_price(plants, ctx):
     return [plant for plant in plants if plant.cost < ctx.p_eq]
 
 
+def positive_npv(discount_rate=0.15):
+    """PLACEHOLDER selector: move every mine whose cost sits below the current price.
+    """
+
+    def npv(plant, ctx):
+        predicted_p_eq = [ctx.p_eq] * 20
+        return sum(plant.capacity * (predicted_p_eq[i] - plant.cost) / (1 + discount_rate)**(i+1) for i in range(20))
+
+    return per_mine(lambda plant, ctx: npv(plant, ctx) > 0)
+
+
 def persistently_unprofitable(plants, ctx):
     """Selector: move every mine that has been losing money for long enough to shut."""
     return [plant for plant in plants
@@ -330,7 +341,7 @@ def default_mine_pipeline():
         Pool("resource", [Transition(cheaper_than_price, to="developing")]),
         Pool("developing", [Transition(after_years(4), to="incentive")]),
         # TODO: placeholder rule, swap for the NPV calculation
-        Pool("incentive", [Transition(cheaper_than_price, to="opening")]),
+        Pool("incentive", [Transition(positive_npv(), to="opening")]),
         Pool("opening", [Transition(after_years(2), to="operating")]),
         Pool("operating", [Transition(persistently_unprofitable, to="retired")]),
         Pool("retired", frozen=True),
