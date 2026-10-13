@@ -2,7 +2,7 @@ import itertools
 
 import numpy as np
 
-from .utils import CompositeDemand, SupplyCurve2D, cheapest_covering, find_intersection
+from .utils import Sector, SupplyCurve2D, cheapest_covering, find_intersection
 
 # Numerical guard: a mine whose remaining reserves fall below this fraction of its capacity is exhausted
 EXHAUSTION_TOLERANCE = 1e-9
@@ -448,9 +448,9 @@ class SupplyChainStage():
 
         Args:
             supply (callable): Supply for that stage. Its plants become the operating pool.
-            demand (callable): Demand for that stage.
-            name (str): Human-readable stage name (e.g. "midstream"). Used so plants can reference
-                another stage's production by name.
+            demand (CompositeDemand): The child stages and sectors drawing from this stage.
+            name (str): Human-readable stage name (e.g. "midstream"). Used so plants and sectors can
+                reference the stage by name.
             pipeline (Pipeline): The stage's pools.
             pools (dict, optional): Starting membership, {pool name: list of plants}, for pools other
                 than operating. Any pool left out starts empty.
@@ -460,9 +460,12 @@ class SupplyChainStage():
         self.demand = demand
         self.name = name
         self.parent = None
-        if isinstance(demand, CompositeDemand):
-            for downstream in demand.downstreams:
-                downstream.parent = self
+        for child in demand.stages:
+            child.parent = self
+        if demand.sectors and demand.base_price is None:
+            raise ValueError(f"Stage {name!r} has sectors drawing from it but its CompositeDemand has no base_price.")
+        for sector in demand.sectors:
+            sector.set_base_price(name, demand.base_price)
         self.p_eq = None
         # Set by SupplyChain: the smoothed price supply decisions respond to, and the model parameters
         self.decision_price = None
@@ -500,16 +503,40 @@ class SupplyChainStage():
         """
         self.supply.set_plants(plants)
 
-    def _step_demand(self, ctx):
-        """Advance a leaf stage's demand to this year (SectorDemand.step), anchored at its own price last
-        year. A CompositeDemand points at the live child stages, which are stepped themselves, so it
-        needs nothing.
+    def demand_on(self, stage_name, prices):
+        """Quantity this stage draws from its parent at stage prices {stage name: price}.
 
         Args:
-            ctx (StageContext): Read-only view of last year's solved chain.
+            stage_name (str): The parent stage's name.
+            prices (dict): {stage name: price}, including this stage and its parent.
+
+        Returns:
+            float: Upstream quantity.
         """
-        if not isinstance(self.demand, CompositeDemand):
-            self.demand.step(ctx.year, self.p_eq, self.params)
+        return self.supply.upstream_demand(prices[self.name], prices[stage_name])
+
+    def demand_at(self, p):
+        """Quantity demanded from this stage at price(s) p, with everything else held: each child stage
+        at its own equilibrium given p, and every other stage a sector draws from at the price the
+        sector is anchored at.
+
+        Args:
+            p (float or array): Price(s) of this stage.
+
+        Returns:
+            float or array: Quantity demanded at each price.
+        """
+        p_arr = np.atleast_1d(np.asarray(p, dtype=float))
+        quantity = np.zeros_like(p_arr)
+        for i, pi in enumerate(p_arr):
+            for d in self.demand.downstreams:
+                if isinstance(d, Sector):
+                    prices = {**d.prices, self.name: pi}
+                else:
+                    prices = {self.name: pi, d.name: d.get_equilibrium_price(pi)}
+                quantity[i] += d.demand_on(self.name, prices)
+
+        return quantity.item() if np.isscalar(p) else quantity
 
     def get_equilibrium_price(self, p_u=None):
         """Find the equilibrium price (intersection of supply and demand) for this stage. At an upstream price p_u if need be.
@@ -528,7 +555,7 @@ class SupplyChainStage():
             costs = self.supply.costs
             s = self.supply
         bracket = (max(costs.min() * 0.1, 1e-12), costs.max() * 10.0)
-        return find_intersection(s, self.demand, bracket=bracket)
+        return find_intersection(s, self.demand_at, bracket=bracket)
 
     def plot_sd(self, ax, p_u=None):
         """Helpful function to plot the supply and demand curves for the stage.
@@ -546,7 +573,7 @@ class SupplyChainStage():
             ax.plot(self.supply(y), y, lw=2, zorder=3, label="Supply")
 
         x_lims = ax.get_xlim()
-        ax.plot(self.demand(y[::4]), y[::4], lw=2, zorder=3, label="Demand")
+        ax.plot(self.demand_at(y[::4]), y[::4], lw=2, zorder=3, label="Demand")
 
         ax.set_xlim(x_lims)
         ax.grid()
@@ -703,8 +730,6 @@ class MiningStage(SupplyChainStage):
         # pools["operating"] is the truth, the supply curve just mirrors it
         self.set_plants(self.pools["operating"])
 
-        self._step_demand(ctx)
-
     def _deplete(self, mines, ctx):
         """Depletion: each mine loses last year's production from its reserves, and its grade moves
         along grade_fn at last year's utilisation (production / nameplate capacity).
@@ -817,8 +842,6 @@ class ProcessingStage(SupplyChainStage):
         self.set_plants(self.pools["operating"])
         if isinstance(self.supply, SupplyCurve2D) and self.parent is not None:
             self.supply.set_upstream_price(ctx.price_of(self.parent.name))
-
-        self._step_demand(ctx)
 
     def _learn(self):
         """Learning: conversion cost falls by plant_learning_rate for every plant in construction or

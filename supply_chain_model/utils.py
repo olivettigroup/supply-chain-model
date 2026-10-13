@@ -259,75 +259,93 @@ class SupplyCurve2D():
 
         return demand.item() if np.isscalar(p_d) else demand
     
-class SectorDemand():
-    def __init__(self, base_price, elasticity, V0, I0, cagr, phi=1.0, chi=1.0, sectors=None):
-        """Demand of a leaf stage, built bottom-up from sectors: D(p) = q_nom * (p / p_nom)**elasticity.
+class Sector():
+    def __init__(self, name, elasticity, V0, cagr, intensities, phi=1.0, chi=1.0, other_cost=0.0):
+        """A demand sector (e.g. a product): one driver volume that responds to the price of its
+        inputs, drawing material from one or more stages.
 
-        Each sector s has a driver V_s (e.g. units sold) and an intensity I_s (material per driver
-        unit); its nominal demand is D_s = V_s * I_s, and q_nom = sum of D_s. The curve passes through
-        (p_nom, q_nom): p_nom is base_price in the first year and last year's equilibrium price after
-        that. Sector arguments are arrays with one entry per sector, or scalars for a single sector.
+        Its input price is P = other_cost + sum over drawn stages e of I_e * p_e, and its volume is
+        V = V_nom * (P / P_nom)**elasticity. The curve passes through (P_nom, V_nom): P_nom is the
+        input price at the drawn stages' base prices in the first year, and at last year's equilibrium
+        prices after that. Stage e draws I_e * V.
 
         Args:
-            base_price (float): Price at which the first year's nominal demand applies.
-            elasticity (float): Price elasticity of the stage's demand.
-            V0 (array): Drivers in the first year.
-            I0 (array): Intensities in the first year (0 allowed).
-            cagr (array): Driver growth rates at the start of the run.
-            phi (array, optional): Factor by which driver growth is scaled by the end of the run.
+            name (str): Sector name, used in the records.
+            elasticity (float): Price elasticity of the sector's volume to its input price.
+            V0 (float): Driver volume in the first year (e.g. units sold).
+            cagr (float): Driver growth rate at the start of the run.
+            intensities (dict): {stage name: material drawn per driver unit in the first year}.
+                Zero allowed.
+            phi (float, optional): Factor by which driver growth is scaled by the end of the run.
                 Defaults to 1 (constant growth).
-            chi (array, optional): Factor by which intensity has changed by the end of the run. Defaults
-                to 1 (constant intensity).
-            sectors (list, optional): Sector names. Defaults to "sector 0", "sector 1", ...
+            chi (float, optional): Factor by which every intensity has changed by the end of the run.
+                Defaults to 1 (constant intensity).
+            other_cost (float, optional): Non-material cost per driver unit, part of the input price.
+                Defaults to 0.
         """
-        V0, I0, cagr, phi, chi = np.broadcast_arrays(*(np.atleast_1d(np.asarray(x, dtype=float))
-                                                       for x in (V0, I0, cagr, phi, chi)))
-        self.V = V0.copy()
-        self.I0 = I0.copy()
-        self.cagr = cagr.copy()
-        self.phi = phi.copy()
-        self.chi = chi.copy()
-        self.k = np.ones_like(self.V)
-        self.sectors = list(sectors) if sectors is not None else [f"sector {i}" for i in range(len(self.V))]
-        if len(self.sectors) != len(self.V):
-            raise ValueError(f"{len(self.sectors)} sector names for {len(self.V)} sectors.")
+        self.name = name
         self.elasticity = elasticity
-        self.p_nom = base_price
-        self.q_nom = float(np.sum(self.sector_demand))
+        self.V = float(V0)
+        self.cagr = cagr
+        self.phi = phi
+        self.chi = chi
+        self.other_cost = other_cost
+        self.I0 = {stage: float(I) for stage, I in intensities.items()}
+        self.k = 1.0
+        # Prices of the drawn stages the curve is anchored at, filled in with base prices as the
+        # stages are built; P_nom is set once every drawn stage has one
+        self.prices = {}
+        self.P_nom = None
 
     @property
-    def intensity(self):
-        """Each sector's intensity this year: I0 * k."""
-        return self.I0*self.k
+    def intensities(self):
+        """This year's intensity per drawn stage: I0 * k."""
+        return {stage: I*self.k for stage, I in self.I0.items()}
 
-    @property
-    def sector_demand(self):
-        """Each sector's nominal demand this year: V * I."""
-        return self.V*self.intensity
+    def price(self, prices):
+        """The sector's input price at stage prices {stage name: price}."""
+        return self.other_cost + sum(I*prices[stage] for stage, I in self.intensities.items())
 
-    def step(self, t, last_price, params):
-        """Demand update for year t: advance every sector's driver and intensity, then re-anchor the
-        curve at last year's equilibrium price.
+    def volume(self, prices):
+        """The sector's driver volume at stage prices {stage name: price}. A sector whose input price
+        is zero (every intensity and other_cost zero) has nothing to respond to and stays at V_nom."""
+        if self.P_nom == 0:
+            return self.V
+        return self.V*(self.price(prices)/self.P_nom)**self.elasticity
+
+    def demand_on(self, stage_name, prices):
+        """Quantity the sector draws from a stage at stage prices {stage name: price}."""
+        return self.I0[stage_name]*self.k*self.volume(prices)
+
+    def set_base_price(self, stage_name, base_price):
+        """Record a drawn stage's base price; the first-year anchor is set once every drawn stage has one.
+
+        Args:
+            stage_name (str): A stage the sector draws from.
+            base_price (float): That stage's price at which V0 applies.
+        """
+        self.prices[stage_name] = base_price
+        if set(self.prices) == set(self.I0):
+            self.P_nom = self.price(self.prices)
+
+    def step(self, ctx, params):
+        """Sector update for year ctx.year: advance the driver and the intensities, then re-anchor the
+        curve at last year's equilibrium prices.
 
             x        = (t - t0) / (T - t0), clipped at 1, with t0 = start_year and T = end_year
-            V(s, t)  = V(s, t-1) * (1 + cagr_s * phi_s**x)
-            I(s, t)  = I0_s * chi_s**x
-            q_nom(t) = sum of V(s, t) * I(s, t),  p_nom(t) = last_price
+            V_nom(t) = V_nom(t-1) * (1 + cagr * phi**x)
+            I_e(t)   = I0_e * chi**x
+            P_nom(t) = other_cost + sum of I_e(t) * p_e(t-1)
 
         Args:
-            t (int): Year being stepped into.
-            last_price (float): The stage's equilibrium price last year.
+            ctx (StageContext): Read-only view of last year's solved chain.
             params (ModelParams): Model parameters; uses start_year and end_year.
         """
-        x = min((t - params.start_year)/max(params.end_year - params.start_year, 1), 1.0)
+        x = min((ctx.year - params.start_year)/max(params.end_year - params.start_year, 1), 1.0)
         self.V = self.V*(1 + self.cagr*self.phi**x)
         self.k = self.chi**x
-        self.q_nom = float(np.sum(self.sector_demand))
-        self.p_nom = last_price
-
-    def __call__(self, p):
-        """Quantity demanded at price(s) p."""
-        return self.q_nom*(np.asarray(p, dtype=float)/self.p_nom)**self.elasticity
+        self.prices = {stage: ctx.price_of(stage) for stage in self.I0}
+        self.P_nom = self.price(self.prices)
 
 def find_intersection(supply_curve, demand_curve, bracket):
     """Finds the intersection of a supply and demand curve.
@@ -361,36 +379,26 @@ def find_intersection(supply_curve, demand_curve, bracket):
     return root_scalar(f, bracket=(p_lo, p_hi), method="brentq").root
 
 class CompositeDemand():
-    def __init__(self, downstreams, other=0):
-        """Sums the demand from one or more downstream stages.
+    def __init__(self, downstreams, base_price=None):
+        """The demand on a stage: what its child stages and the sectors drawing from it take.
 
         Args:
-            downstreams (SupplyChainStages): Supply chain stages that are downstream.
-            other (float, optional): Additional demand from unsimulated stages. Defaults to 0.
+            downstreams (list): Child SupplyChainStages and Sectors.
+            base_price (float, optional): The stage's price at which its sectors' V0 apply. Required
+                when sectors draw from the stage.
         """
-        self.downstreams = downstreams
-        self.other = other
+        self.downstreams = list(downstreams)
+        self.base_price = base_price
 
-    def __call__(self, p):
-        """Evaluation of the demand curve.
+    @property
+    def stages(self):
+        """The child stages."""
+        return [d for d in self.downstreams if not isinstance(d, Sector)]
 
-        Args:
-            p (array): Prices to evaluate the curve at.
-
-        Returns:
-            array: Resulting quantities for each price.
-        """
-        scalar_input = np.isscalar(p)
-        p_arr = np.atleast_1d(np.asarray(p, dtype=float))
-        supply = np.zeros_like(p_arr)
-
-        for i, pi in enumerate(p_arr):
-            for downstream in self.downstreams:
-                supply[i] += downstream.supply.upstream_demand(downstream.get_equilibrium_price(pi), p_u=pi)
-
-        supply += self.other
-        
-        return supply.item() if scalar_input else supply
+    @property
+    def sectors(self):
+        """The sectors drawing from the stage."""
+        return [d for d in self.downstreams if isinstance(d, Sector)]
 
 def cheapest_covering(plants, gap):
     """Greedy gap fill: the cheapest plants whose combined capacity covers a gap.
@@ -416,44 +424,39 @@ def cheapest_covering(plants, gap):
     return [plant for plant, before in zip(ordered, committed) if before < gap]
 
 def build_chain(start_node):
-    """Given any node in the graph, builds the parents and children index list with ordered nodes list.
+    """Given any stage in the graph, list every stage with its parent's index, parents before children.
 
     Args:
         start_node (SupplyChainStage): Any stage in the supply chain graph.
 
     Returns:
-        lists: Lists of nodes, parent, and children.
+        tuple: (stages, parent index of each stage, -1 for the root).
     """
 
     root_node = start_node
     while root_node.parent is not None:
         root_node = root_node.parent
 
-    nodes, parent, children = [], [], []
+    nodes, parent = [], []
 
     def visit(node, parent_idx):
         idx = len(nodes)
         nodes.append(node)
         parent.append(parent_idx)
-        children.append([])
-        if parent_idx >= 0:
-            children[parent_idx].append(idx)
-        if isinstance(node.demand, CompositeDemand):
-            for child in node.demand.downstreams:
-                visit(child, idx)
+        for child in node.demand.stages:
+            visit(child, idx)
 
     visit(root_node, -1)
 
-    return nodes, parent, children
+    return nodes, parent
 
-def _residuals(logp, nodes, parent, children):
+def _residuals(logp, nodes, parent):
     """Price residuals for every stage.
 
     Args:
         logp (array): Log of prices.
         nodes (array): List of SupplyChainStages.
-        parent (array): Parent node for every stage.
-        children (array): Children nodes for every stage.
+        parent (array): Parent index for every stage.
 
     Returns:
         array: Residuals between supply and demand for every stage at prices logp.
@@ -461,39 +464,34 @@ def _residuals(logp, nodes, parent, children):
 
     # Transform back into regular space
     p = np.exp(logp)
+    prices = {node.name: pi for node, pi in zip(nodes, p)}
 
     # Get the supply at each stage
     S = np.array([nodes[i].supply(p[i]) if parent[i] < 0 else nodes[i].supply(p[i], p[parent[i]]) for i in range(len(nodes))])
 
-    # For convergence, we scale the residuals 
+    # For convergence, we scale the residuals
     scale = np.array([n.supply.capacities.sum() for n in nodes])
-    
-    # For every node, calculate the demand and subtract it from the supply to get the residual
+
+    # Demand on each stage: what its child stages and sectors draw from it at these prices
     res = np.empty(len(nodes))
     for i, node in enumerate(nodes):
-        if isinstance(node.demand, CompositeDemand):
-            D = node.demand.other + sum(nodes[c].supply.upstream_demand(p[c], p[i]) for c in children[i])
-        else:
-            D = node.demand(p[i])
-
-        # No matter the demand, subtract the supply and scale it for better convergence
+        D = sum(d.demand_on(node.name, prices) for d in node.demand.downstreams)
         res[i] = (S[i] - D) / scale[i]
-    
+
     return res
 
-def solve_chain(nodes, parent, children, p0=None):
+def solve_chain(nodes, parent, p0=None):
     """Solves the prices for one SupplyChain
 
     Args:
         nodes (array): List of SupplyChainStages.
-        parent (array): Parent node for every stage.
-        children (array): Children nodes for every stage.
+        parent (array): Parent index for every stage.
         p0 (array, optional): Initial guesses. Defaults to None.
 
     Returns:
         dict: Dictionnary with SupplyChainStages as keys and their equilibrium prices as values.
     """
-    
+
     # A price can't sit far below the stage's cheapest plant. For a child, take the cheapest cost at
     # the parent's own lower bound, so the bound holds however far the parent's price falls this year.
     # nodes lists every parent before its children, so the parent's bound is always ready.
@@ -511,7 +509,7 @@ def solve_chain(nodes, parent, children, p0=None):
     x0 = np.clip(np.log(np.asarray(p0, dtype=float)), lb, None)
     
     # Solve
-    sol = least_squares(_residuals, x0, args=(nodes, parent, children), method="trf", bounds=(lb, np.inf), xtol=1e-12, ftol=1e-12)
+    sol = least_squares(_residuals, x0, args=(nodes, parent), method="trf", bounds=(lb, np.inf), xtol=1e-12, ftol=1e-12)
     
     # Return prices and write them to the nodes
     p = np.exp(sol.x)

@@ -11,12 +11,12 @@ from .supply_chain_stages import (
     SupplyChainStage, MiningStage, ProcessingStage,
     Pipeline, PoolContext, mine_npv, plant_npv, default_grade_fn, flat_decision_price,
 )
-from .utils import SupplyCurve, SupplyCurve2D, SectorDemand, CompositeDemand, generate_cost_curve
+from .utils import SupplyCurve, SupplyCurve2D, Sector, CompositeDemand, generate_cost_curve
 
 __all__ = [
     "ModelParams", "SupplyChain", "StageContext",
     "SupplyPlant", "Mine", "WasteStream",
     "SupplyChainStage", "MiningStage", "ProcessingStage",
     "Pipeline", "PoolContext", "mine_npv", "plant_npv", "default_grade_fn", "flat_decision_price",
-    "SupplyCurve", "SupplyCurve2D", "SectorDemand", "CompositeDemand", "generate_cost_curve",
+    "SupplyCurve", "SupplyCurve2D", "Sector", "CompositeDemand", "generate_cost_curve",
 ]

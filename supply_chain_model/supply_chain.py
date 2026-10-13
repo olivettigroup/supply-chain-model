@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .utils import build_chain, solve_chain, SectorDemand, SupplyCurve2D, MIN_COST_FACTOR
+from .utils import build_chain, solve_chain, SupplyCurve2D, MIN_COST_FACTOR
 from .supply_chain_stages import MiningStage
 
 
@@ -76,11 +76,11 @@ class SupplyChain:
             verbosity (int, optional): Print the year as it runs if above 0. Defaults to 0.
         """
         # One deepcopy call over the whole list, so the copies share one memo and the graph
-        # (parent links, CompositeDemand children) stays wired up inside the copy
+        # (parent links, child stages and sectors) stays wired up inside the copy
         own_stages = copy.deepcopy(list(input_stages))
 
         self.params = params if params is not None else ModelParams()
-        self.stages, self.parent, self.children = build_chain(own_stages[0])
+        self.stages, self.parent = build_chain(own_stages[0])
         for stage in self.stages:
             stage.set_params(self.params)
         self.mine_idx = [k for k, s in enumerate(self.stages) if isinstance(s, MiningStage)]
@@ -93,8 +93,20 @@ class SupplyChain:
                 raise ValueError(f"Duplicate stage name {s.name!r}; stage names must be unique.")
             self.stage_idx[s.name] = k
 
+        # Every sector once, however many stages it draws from
+        self.sectors = []
+        for stage in self.stages:
+            for sector in stage.demand.sectors:
+                if not any(sector is known for known in self.sectors):
+                    self.sectors.append(sector)
+        for sector in self.sectors:
+            for name in sector.I0:
+                if name not in self.stage_idx or not any(sector is d for d in self.stages[self.stage_idx[name]].demand.sectors):
+                    raise ValueError(f"Sector {sector.name!r} draws from {name!r}, which is not a stage whose "
+                                     "CompositeDemand lists the sector.")
+
         # Filled in as the run goes: deepcopy snapshots, prices by name, one record row per plant per year,
-        # one demand row per leaf sector per year
+        # one demand row per sector per drawn stage per year
         self.stages_history = {}
         self.prices = {}
         self.records = []
@@ -151,16 +163,44 @@ class SupplyChain:
         return pd.DataFrame(self.records)
 
     def demand_df(self):
-        """Leaf demand as a DataFrame: one row per sector per leaf stage per year.
+        """Sector demand as a DataFrame: one row per sector per drawn stage per year.
 
-        Columns: year, stage, sector, driver (V), intensity (I), nominal_demand (V * I), and for the
-        stage as a whole q_nom, p_nom, p_eq and realised (the stage's production at p_eq).
+        Columns: year, sector, stage, nominal_driver (V_nom), driver (V at the solved prices),
+        sector_price (P at the solved prices), p_nom (P_nom), intensity, and consumption
+        (intensity * driver, what the sector took from the stage).
 
         Returns:
             pandas.DataFrame: The recorded rows.
         """
         import pandas as pd
         return pd.DataFrame(self.demand_records)
+
+    def demand_elasticities(self, step=1e-4):
+        """Price elasticities of sector demand at the latest solved prices, with no re-solve.
+
+        Entry (i, j) is the % change in the sector demand on stage i per 1% change in stage j's price,
+        all other prices held: the diagonal holds each stage's own-price elasticity, the rest the
+        coupling through shared sectors. Only stages that sectors draw from are included.
+
+        Args:
+            step (float, optional): Log price step of the central difference. Defaults to 1e-4.
+
+        Returns:
+            pandas.DataFrame: Rows are the demand stages, columns the stages whose price moves.
+        """
+        import pandas as pd
+        names = [s.name for s in self.stages if s.demand.sectors]
+        prices = {s.name: s.p_eq for s in self.stages}
+
+        def log_demand(stage_name, at):
+            return np.log(sum(sector.demand_on(stage_name, at) for sector in self.stages[self.stage_idx[stage_name]].demand.sectors))
+
+        table = {}
+        for j in names:
+            up = {**prices, j: prices[j]*np.exp(step)}
+            down = {**prices, j: prices[j]*np.exp(-step)}
+            table[j] = [(log_demand(i, up) - log_demand(i, down))/(2*step) for i in names]
+        return pd.DataFrame(table, index=names)
 
     def prices_df(self):
         """Prices as a DataFrame indexed by year: one column per stage with the equilibrium price,
@@ -187,7 +227,7 @@ class SupplyChain:
         p0 = [s.p_eq for s in self.stages]
         p0 = p0 if all(p is not None for p in p0) else None
 
-        res = solve_chain(self.stages, self.parent, self.children, p0=p0)
+        res = solve_chain(self.stages, self.parent, p0=p0)
         for node, pi in res.items():
             node.p_eq = pi
 
@@ -233,6 +273,8 @@ class SupplyChain:
                 ctx = StageContext(self.stages, t)
                 for stage in self.stages:
                     stage.step(ctx)
+                for sector in self.sectors:
+                    sector.step(ctx, self.params)
 
             # Scenario hook can mutate this year's stages before they're solved
             if scenario is not None:
@@ -246,27 +288,29 @@ class SupplyChain:
             self._record(t)
 
     def _record(self, t):
-        """Write this year's prices and one row per plant into the flat records list.
+        """Write this year's prices, one row per sector per drawn stage, and one row per plant into the
+        flat records lists.
 
         Args:
             t (int): Year being recorded.
         """
-        self.prices[t] = {s.name: s.p_eq for s in self.stages}
+        prices = {s.name: s.p_eq for s in self.stages}
+        self.prices[t] = dict(prices)
         self.prices[t].update({f"{s.name} (decision)": s.decision_price for s in self.stages})
+
+        for sector in self.sectors:
+            driver = sector.volume(prices)
+            for name, intensity in sector.intensities.items():
+                self.demand_records.append({
+                    "year": t, "sector": sector.name, "stage": name,
+                    "nominal_driver": sector.V, "driver": driver,
+                    "sector_price": sector.price(prices), "p_nom": sector.P_nom,
+                    "intensity": intensity, "consumption": intensity*driver,
+                })
 
         for stage in self.stages:
             output = _plant_output(stage).ravel()
             produced = {p.uid: float(q) for p, q in zip(stage.supply.plants, output)}
-
-            demand = stage.demand
-            if isinstance(demand, SectorDemand):
-                for sector, V, I, D in zip(demand.sectors, demand.V, demand.intensity, demand.sector_demand):
-                    self.demand_records.append({
-                        "year": t, "stage": stage.name, "sector": sector,
-                        "driver": float(V), "intensity": float(I), "nominal_demand": float(D),
-                        "q_nom": demand.q_nom, "p_nom": demand.p_nom, "p_eq": stage.p_eq,
-                        "realised": float(output.sum()),
-                    })
 
             for pool_name, plants in stage.all_pools().items():
                 for plant in plants:
