@@ -28,10 +28,17 @@ class ModelParams:
         closed_destination (str): Pool a closed mine returns to.
         closed_cooldown (int): Years a mine spends in "closed" before returning.
         plant_construction_time (int): Years a processing plant spends in "construction".
-        plant_learning_rate (float): Annual fall in processing conversion costs.
-        expansion_utilisation_threshold (float): Utilisation of a processing stage above which it expands.
-        expansion_target_utilisation (float): Utilisation that expansion builds back to.
-        expansion_cost_percentile (float): Percentile of operating conversion costs given to template plants.
+        plant_life (int): Years of production counted in the template plant NPV.
+        plant_learning_rate (float): Annual fall in the conversion cost of existing processing plants
+            (construction and operating; idle plants don't learn).
+        technology_rate (float): Annual fall in the frontier conversion cost of new processing plants.
+        expansion_cost_percentile (float): Percentile of the starting regular plants' conversion costs
+            that sets the starting frontier.
+        expansion_speed (float): Share of last year's operating capacity built per unit of the template
+            plant's profitability index.
+        max_expansion_share (float): Cap on the capacity built in a year, as a share of last year's
+            operating capacity.
+        max_idle_years (int): Years a processing plant can stay idle before it closes.
     """
     start_year: int = 2024
     end_year: int = 2050
@@ -46,10 +53,13 @@ class ModelParams:
     closed_destination: str = "developing"
     closed_cooldown: int = 1
     plant_construction_time: int = 2
-    plant_learning_rate: float = 0.01
-    expansion_utilisation_threshold: float = 0.90
-    expansion_target_utilisation: float = 0.85
+    plant_life: int = 25
+    plant_learning_rate: float = 0.005
+    technology_rate: float = 0.015
     expansion_cost_percentile: float = 50
+    expansion_speed: float = 0.5
+    max_expansion_share: float = 0.15
+    max_idle_years: int = 3
 
 
 class SupplyChain:

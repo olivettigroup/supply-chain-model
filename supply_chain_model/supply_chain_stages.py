@@ -12,7 +12,7 @@ class SupplyPlant:
     # Shared counter so every plant ever built gets a different uid
     _uid_counter = itertools.count()
 
-    def __init__(self, capacity, cost, intensity=None, years_in_pool=0, synthetic=False, uid=None):
+    def __init__(self, capacity, cost, intensity=None, capex=None, years_in_pool=0, synthetic=False, uid=None):
         """Generic type for a plant that produces a material.
 
         The plant's primitive cost is its conversion cost, the non-material cost per unit of output.
@@ -25,6 +25,8 @@ class SupplyPlant:
                 add_plants, it is taken as quoted at the curve's upstream price and split into
                 conversion cost and input cost; otherwise it is the conversion cost.
             intensity (float, optional): How much of the upstream material is needed for production. Defaults to None.
+            capex (float, optional): Total capex in currency. Only plants the model builds need one;
+                an existing plant's capex is sunk and never used. Defaults to None.
             years_in_pool (int, optional): Full years spent in the current pool. Defaults to 0.
             synthetic (bool, optional): True for plants the model or the data generator created.
                 Defaults to False.
@@ -36,6 +38,7 @@ class SupplyPlant:
         self.intensity = intensity
         self.conversion_cost = cost
         self.upstream_price = 0.0
+        self.capex = capex
         self.years_in_pool = years_in_pool
         self.synthetic = synthetic
         self.pool_history = []
@@ -260,18 +263,31 @@ def default_grade_fn(grade, utilisation, params):
     return grade*(1 - params.grade_decline_rate*utilisation)
 
 
-def flat_decision_price(ctx, mine, n_years):
-    """Default NPV price path: last year's decision price of the mine's stage, for every year.
+def flat_decision_price(ctx, stage_name, n_years):
+    """Default NPV price path: last year's decision price of the named stage, for every year.
 
     Args:
-        ctx (PoolContext): Context of the mine's stage.
-        mine (Mine): Unused by the default; there so a replacement can use it.
+        ctx (PoolContext): Context of the stage making the decision.
+        stage_name (str): Stage whose price path is wanted (the stage itself, or its parent).
         n_years (int): Length of the path.
 
     Returns:
         array: Price in each production year.
     """
-    return np.full(n_years, ctx.decision_price)
+    return np.full(n_years, ctx.ctx.decision_price_of(stage_name))
+
+
+def present_value(cash, rate):
+    """Present value of yearly cash flows indexed from k = 0, each discounted by (1 + rate)**k.
+
+    Args:
+        cash (array): Cash flow in each year.
+        rate (float): Discount rate.
+
+    Returns:
+        float: The present value.
+    """
+    return float(np.sum(cash/(1 + rate)**np.arange(len(cash))))
 
 
 def mine_npv(mine, ctx, params, price_path_fn):
@@ -290,7 +306,7 @@ def mine_npv(mine, ctx, params, price_path_fn):
         mine (Mine): The mine. It is not modified.
         ctx (PoolContext): Context of the mine's stage; ctx.stage.grade_fn gives the grade path.
         params (ModelParams): Model parameters.
-        price_path_fn (callable): price_path_fn(ctx, mine, n_years) -> price in each production year.
+        price_path_fn (callable): price_path_fn(ctx, stage_name, n_years) -> price in each production year.
 
     Returns:
         float: The NPV.
@@ -311,8 +327,46 @@ def mine_npv(mine, ctx, params, price_path_fn):
     capex_years = max(build, 1)
     cash = np.zeros(build + life)
     cash[:capex_years] -= mine.capex/capex_years
-    cash[build:] += (price_path_fn(ctx, mine, life) - cost)*quantity
-    return float(np.sum(cash/(1 + params.discount_rate)**np.arange(build + life)))
+    cash[build:] += (price_path_fn(ctx, ctx.stage.name, life) - cost)*quantity
+    return present_value(cash, params.discount_rate)
+
+
+def plant_npv(plant, ctx, params, price_path_fn):
+    """Net present value of building a processing plant now, and the present value of its capex.
+
+    Years are counted from the decision year, k = 0: a plant built in year t operates from year
+    t + plant_construction_time.
+    - Capex: -capex / plant_construction_time in each of k = 0 ... plant_construction_time - 1 (all of
+      it at k = 0 if plant_construction_time is 0).
+    - Production: k = plant_construction_time ... plant_construction_time + plant_life - 1, at full
+      capacity, with cash flow (p_k - c_k - intensity * p_parent_k) * capacity. The plant learns from
+      construction on: c_k = conversion_cost * (1 - plant_learning_rate)**k. Prices come from
+      price_path_fn for the stage and its parent (0 for a stage with no parent).
+    - Each year is discounted by (1 + discount_rate)**k.
+
+    Args:
+        plant (SupplyPlant): The candidate plant, with capacity, conversion_cost, intensity and capex set.
+        ctx (PoolContext): Context of the plant's stage.
+        params (ModelParams): Model parameters.
+        price_path_fn (callable): price_path_fn(ctx, stage_name, n_years) -> price in each production year.
+
+    Returns:
+        tuple: (NPV, present value of the capex).
+    """
+    build, life = params.plant_construction_time, params.plant_life
+    k = np.arange(build + life)
+
+    capex_years = max(build, 1)
+    capex = np.zeros(build + life)
+    capex[:capex_years] = plant.capex/capex_years
+
+    price = price_path_fn(ctx, ctx.stage.name, life)
+    parent_price = np.zeros(life) if ctx.stage.parent is None else price_path_fn(ctx, ctx.stage.parent.name, life)
+    cost = plant.conversion_cost*(1 - params.plant_learning_rate)**k[build:]
+
+    cash = -capex
+    cash[build:] += (price - cost - (plant.intensity or 0.0)*parent_price)*plant.capacity
+    return present_value(cash, params.discount_rate), present_value(capex, params.discount_rate)
 
 
 # ---------------------------------------------------------------------------
@@ -349,12 +403,21 @@ def positive_npv(plants, ctx):
     return movers
 
 
+def margin(plant, ctx):
+    """A processing plant's running margin at last year's decision prices:
+    P - (conversion_cost + intensity * P_parent)."""
+    return ctx.decision_price - (plant.conversion_cost + (plant.intensity or 0.0)*ctx.parent_decision_price)
+
+
 def negative_margin(plants, ctx):
-    """operating -> closed (processing): every plant whose margin at last year's decision prices is
-    negative, margin = P - (conversion_cost + intensity * P_parent). Waste streams never close."""
-    return [plant for plant in plants
-            if not isinstance(plant, WasteStream)
-            and ctx.decision_price - (plant.conversion_cost + (plant.intensity or 0.0)*ctx.parent_decision_price) < 0]
+    """operating -> idle: every plant whose margin at last year's decision prices is negative. Waste
+    streams never go idle."""
+    return [plant for plant in plants if not isinstance(plant, WasteStream) and margin(plant, ctx) < 0]
+
+
+def margin_recovered(plants, ctx):
+    """idle -> operating: every plant whose margin at last year's decision prices is back at 0 or above."""
+    return [plant for plant in plants if margin(plant, ctx) >= 0]
 
 
 def fill_incentive_gap(plants, ctx):
@@ -517,7 +580,7 @@ class MiningStage(SupplyChainStage):
             resource_pool (list, optional): Shorthand for pools={"resource": ...}.
             grade_fn (callable, optional): grade_fn(grade, utilisation, params) -> next year's grade of
                 a mine that produced at the given utilisation. Defaults to default_grade_fn.
-            price_path_fn (callable, optional): price_path_fn(ctx, mine, n_years) -> expected price in
+            price_path_fn (callable, optional): price_path_fn(ctx, stage_name, n_years) -> expected price in
                 each production year, used in the NPV. Defaults to flat_decision_price.
         """
 
@@ -658,23 +721,45 @@ class MiningStage(SupplyChainStage):
 
 
 class ProcessingStage(SupplyChainStage):
-    POOLS = ("construction", "operating", "closed")
+    POOLS = ("construction", "operating", "idle", "closed")
 
-    def __init__(self, supply, demand, name, pools=None):
-        """Subtype of a SupplyChainStage for processing plants, which are replicable: pools are
-        construction -> operating -> closed, and closed is frozen (plants never re-enter).
+    def __init__(self, supply, demand, name, capex_intensity, pools=None, price_path_fn=flat_decision_price):
+        """Subtype of a SupplyChainStage for processing plants, which are replicable.
 
-        Waste streams sit in operating for good: they never close or expand, but they follow the
-        learning rule and count in the expansion utilisation.
+        Pools are construction -> operating <-> idle -> closed, and closed is frozen (plants never
+        re-enter). New plants are built at the stage's technology frontier when a template plant's NPV
+        is positive.
+
+        Waste streams sit in operating for good: they never go idle, close or expand, but they follow
+        the learning rule and count in the operating capacity that scales expansion.
 
         Args:
             supply (callable): Supply for that stage. Its plants become the operating pool.
             demand (callable): Demand for that stage.
             name (str): Human-readable stage name.
-            pools (dict, optional): Starting membership for "construction" or "closed",
+            capex_intensity (float): Capex of a new plant per unit of annual capacity.
+            pools (dict, optional): Starting membership for "construction", "idle" or "closed",
                 {pool name: list of plants}.
+            price_path_fn (callable, optional): price_path_fn(ctx, stage_name, n_years) -> expected
+                price in each production year, used in the template plant NPV. Defaults to
+                flat_decision_price.
         """
         super().__init__(supply, demand, name, Pipeline(self.POOLS, frozen=("closed",)), pools)
+        self.capex_intensity = capex_intensity
+        self.price_path_fn = price_path_fn
+        # Conversion cost of a plant built now; set from the starting plants in set_params
+        self.frontier_cost = None
+
+    def set_params(self, params):
+        """Give the stage its model parameters, and set the starting technology frontier: the
+        expansion_cost_percentile conversion cost of the starting regular operating plants.
+
+        Args:
+            params (ModelParams): Model parameters.
+        """
+        super().set_params(params)
+        regular = [plant.conversion_cost for plant in self.pools["operating"] if not isinstance(plant, WasteStream)]
+        self.frontier_cost = float(np.percentile(regular, params.expansion_cost_percentile)) if regular else None
 
     def add_plants(self, new_plants):
         """Add plants straight into production, with costs quoted at the stage's current upstream price.
@@ -688,13 +773,20 @@ class ProcessingStage(SupplyChainStage):
     def step(self, ctx):
         """Advance the stage by one year, in place. Decisions use last year's decision prices.
 
-        1. operating -> closed: negative margin (negative_margin).
-        2. Learning on every construction and operating plant (_learn).
-        3. Ageing of every plant that hasn't moved this step (Pipeline.age).
-        4. construction -> operating after plant_construction_time years.
-        5. Expansion with template plants (_expand), measured against last year's pools.
-        6. Waste-stream capacities from their source flows (WasteStream.step).
-        7. The supply curve is rebuilt from the operating pool, at last year's parent price.
+        1. Ageing of every plant (Pipeline.age), before any move, so years_in_pool counts full years.
+        2. idle -> operating: margin back at 0 or above (margin_recovered); the plant produces this year.
+        3. idle -> closed after max_idle_years years idle.
+        4. operating -> idle: negative margin (negative_margin).
+        5. Learning on every construction and operating plant (_learn).
+        6. construction -> operating after plant_construction_time years.
+        7. The technology frontier moves on a year (_advance_frontier).
+        8. Expansion with template plants at the frontier (_expand), measured on last year's pools.
+        9. Waste-stream capacities from their source flows (WasteStream.step).
+        10. The supply curve is rebuilt from the operating pool, at last year's parent price.
+
+        A plant that goes idle in year t and never recovers closes in year t + max_idle_years, after
+        exactly max_idle_years years without production. A plant that moves in a step can't move
+        again in that step, so a plant that restarts can't go idle the same year.
 
         Args:
             ctx (StageContext): Read-only view of last year's solved chain.
@@ -705,18 +797,19 @@ class ProcessingStage(SupplyChainStage):
         params = self.params
         pool_ctx = PoolContext(self, ctx)
         moved = set()
-        # Last year's pools, before any move or learning: expansion is measured against them
+        # Last year's pools, before any move: expansion is measured against them
         last_operating = sum(plant.capacity for plant in self.pools["operating"])
-        last_construction = sum(plant.capacity for plant in self.pools["construction"])
-        last_regular = [(plant.capacity, plant.conversion_cost) for plant in self.pools["operating"]
-                        if not isinstance(plant, WasteStream)]
+        last_regular = [plant.capacity for plant in self.pools["operating"] if not isinstance(plant, WasteStream)]
 
-        self.pipeline.move(self.pools, "operating", "closed", negative_margin, pool_ctx, moved)
-        self._learn()
         self.pipeline.age(self.pools, moved)
+        self.pipeline.move(self.pools, "idle", "operating", margin_recovered, pool_ctx, moved)
+        self.pipeline.move(self.pools, "idle", "closed", after_years(params.max_idle_years), pool_ctx, moved)
+        self.pipeline.move(self.pools, "operating", "idle", negative_margin, pool_ctx, moved)
+        self._learn()
         self.pipeline.move(self.pools, "construction", "operating", after_years(params.plant_construction_time),
                            pool_ctx, moved)
-        self._expand(pool_ctx, last_operating, last_construction, last_regular)
+        self._advance_frontier()
+        self._expand(pool_ctx, last_operating, last_regular)
 
         for plant in self.pools["operating"]:
             if isinstance(plant, WasteStream):
@@ -730,48 +823,50 @@ class ProcessingStage(SupplyChainStage):
 
     def _learn(self):
         """Learning: conversion cost falls by plant_learning_rate for every plant in construction or
-        operating, waste streams included."""
+        operating, waste streams included. Idle plants don't learn."""
         for name in ("construction", "operating"):
             for plant in self.pools[name]:
                 plant.conversion_cost *= (1 - self.params.plant_learning_rate)
 
-    def _expand(self, ctx, last_operating, last_construction, last_regular):
-        """Expansion: build template plants into construction when last year's plants ran close to full
-        and a new plant would make money. Everything is measured on last year's pools.
+    def _advance_frontier(self):
+        """Technology frontier: the conversion cost of a newly built plant falls by technology_rate a year."""
+        if self.frontier_cost is not None:
+            self.frontier_cost *= (1 - self.params.technology_rate)
 
-        utilisation = production last year / operating capacity last year (waste streams included)
-        Builds only if utilisation > expansion_utilisation_threshold and the template plant's margin at
-        last year's decision prices is positive. Then adds template plants until they cover
-            required = production / expansion_target_utilisation - (operating + construction capacity last year)
-        including the plant that crosses it.
+    def _expand(self, ctx, last_operating, last_regular):
+        """Expansion: build template plants into construction when a new plant at the technology
+        frontier has a positive NPV.
 
-        A template plant copies last year's regular (non-waste) operating plants: median capacity,
-        conversion cost at the expansion_cost_percentile percentile, the stage's intensity,
-        synthetic=True.
+        The template plant has the frontier conversion cost, the median capacity of last year's regular
+        (non-waste) operating plants, the stage's intensity and capex = capex_intensity * capacity. If
+        its NPV (plant_npv) is positive:
+            PI          = NPV / PV(capex)        (profitability index)
+            build_share = min(max_expansion_share, expansion_speed * PI)
+            n_plants    = build_share * last year's operating capacity / template capacity, rounded to
+                          the nearest whole plant (waste streams count in the operating capacity)
+        New plants are synthetic and get a (year, "construction") entry in their pool_history.
 
         Args:
             ctx (PoolContext): Context of this stage.
             last_operating (float): Operating capacity during last year's solve.
-            last_construction (float): Construction capacity during last year's solve.
-            last_regular (list): (capacity, conversion cost) of last year's regular operating plants.
+            last_regular (list): Capacities of last year's regular operating plants.
         """
         params = self.params
-        if last_operating <= 0 or not last_regular:
-            return
-        if ctx.production/last_operating <= params.expansion_utilisation_threshold:
+        if self.frontier_cost is None or not last_regular or last_operating <= 0:
             return
 
+        capacity = float(np.median(last_regular))
         intensity = getattr(self.supply, "intensity", None) or 0.0
-        capacities, conversion_costs = np.array(last_regular, dtype=float).T
-        capacity = float(np.median(capacities))
-        conversion_cost = float(np.percentile(conversion_costs, params.expansion_cost_percentile))
-        if ctx.decision_price - (conversion_cost + intensity*ctx.parent_decision_price) <= 0:
+        template = SupplyPlant(capacity, self.frontier_cost, intensity=intensity,
+                               capex=self.capex_intensity*capacity, synthetic=True)
+        npv, pv_capex = plant_npv(template, ctx, params, self.price_path_fn)
+        if npv <= 0:
             return
 
-        required = ctx.production/params.expansion_target_utilisation - (last_operating + last_construction)
-        if required <= 0 or capacity <= 0:
-            return
-        for _ in range(int(np.ceil(required/capacity))):
-            plant = SupplyPlant(capacity, conversion_cost, intensity=intensity, synthetic=True)
+        build_share = min(params.max_expansion_share, params.expansion_speed*npv/pv_capex)
+        n_plants = int(np.floor(build_share*last_operating/capacity + 0.5))
+        for _ in range(n_plants):
+            plant = SupplyPlant(capacity, self.frontier_cost, intensity=intensity,
+                                capex=self.capex_intensity*capacity, synthetic=True)
             plant.pool_history.append((ctx.year, "construction"))
             self.pools["construction"].append(plant)
