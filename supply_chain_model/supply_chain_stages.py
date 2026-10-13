@@ -4,9 +4,6 @@ import numpy as np
 
 from .utils import CompositeDemand, SupplyCurve2D, cheapest_covering, find_intersection
 
-# Annual leaf demand growth
-CHANGE = 0.01
-
 # Numerical guard: a mine whose remaining reserves fall below this fraction of its capacity is exhausted
 EXHAUSTION_TOLERANCE = 1e-9
 
@@ -441,19 +438,16 @@ class SupplyChainStage():
         """
         self.supply.set_plants(plants)
 
-    def _step_demand(self):
-        """Advance demand, in place."""
+    def _step_demand(self, ctx):
+        """Advance a leaf stage's demand to this year (SectorDemand.step), anchored at its own price last
+        year. A CompositeDemand points at the live child stages, which are stepped themselves, so it
+        needs nothing.
 
-        # A CompositeDemand already points at the live child stages, and those get stepped themselves,
-        # so there is nothing to rebuild here
-        if isinstance(self.demand, CompositeDemand):
-            return
-
-        # TODO: make demand curve update more sophisticated
-        # If the stage is a leaf stage (all the way downstream), then we update the demand curve
-        self.demand.p_nom = self.p_eq
-        self.demand.q_nom *= (1 + CHANGE)
-        self.demand.refresh()
+        Args:
+            ctx (StageContext): Read-only view of last year's solved chain.
+        """
+        if not isinstance(self.demand, CompositeDemand):
+            self.demand.step(ctx.year, self.p_eq, self.params)
 
     def get_equilibrium_price(self, p_u=None):
         """Find the equilibrium price (intersection of supply and demand) for this stage. At an upstream price p_u if need be.
@@ -647,7 +641,7 @@ class MiningStage(SupplyChainStage):
         # pools["operating"] is the truth, the supply curve just mirrors it
         self.set_plants(self.pools["operating"])
 
-        self._step_demand()
+        self._step_demand(ctx)
 
     def _deplete(self, mines, ctx):
         """Depletion: each mine loses last year's production from its reserves, and its grade moves
@@ -732,7 +726,7 @@ class ProcessingStage(SupplyChainStage):
         if isinstance(self.supply, SupplyCurve2D) and self.parent is not None:
             self.supply.set_upstream_price(ctx.price_of(self.parent.name))
 
-        self._step_demand()
+        self._step_demand(ctx)
 
     def _learn(self):
         """Learning: conversion cost falls by plant_learning_rate for every plant in construction or

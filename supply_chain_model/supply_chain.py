@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .utils import build_chain, solve_chain, SupplyCurve2D, MIN_COST_FACTOR
+from .utils import build_chain, solve_chain, SectorDemand, SupplyCurve2D, MIN_COST_FACTOR
 from .supply_chain_stages import MiningStage
 
 
@@ -83,10 +83,12 @@ class SupplyChain:
                 raise ValueError(f"Duplicate stage name {s.name!r}; stage names must be unique.")
             self.stage_idx[s.name] = k
 
-        # Filled in as the run goes: deepcopy snapshots, prices by name, one record row per plant per year
+        # Filled in as the run goes: deepcopy snapshots, prices by name, one record row per plant per year,
+        # one demand row per leaf sector per year
         self.stages_history = {}
         self.prices = {}
         self.records = []
+        self.demand_records = []
 
         self._current_year = None
         self.verbosity = verbosity
@@ -137,6 +139,18 @@ class SupplyChain:
         """
         import pandas as pd
         return pd.DataFrame(self.records)
+
+    def demand_df(self):
+        """Leaf demand as a DataFrame: one row per sector per leaf stage per year.
+
+        Columns: year, stage, sector, driver (V), intensity (I), nominal_demand (V * I), and for the
+        stage as a whole q_nom, p_nom, p_eq and realised (the stage's production at p_eq).
+
+        Returns:
+            pandas.DataFrame: The recorded rows.
+        """
+        import pandas as pd
+        return pd.DataFrame(self.demand_records)
 
     def prices_df(self):
         """Prices as a DataFrame indexed by year: one column per stage with the equilibrium price,
@@ -231,8 +245,18 @@ class SupplyChain:
         self.prices[t].update({f"{s.name} (decision)": s.decision_price for s in self.stages})
 
         for stage in self.stages:
-            produced = {p.uid: float(q) for p, q in
-                        zip(stage.supply.plants, _plant_output(stage).ravel())}
+            output = _plant_output(stage).ravel()
+            produced = {p.uid: float(q) for p, q in zip(stage.supply.plants, output)}
+
+            demand = stage.demand
+            if isinstance(demand, SectorDemand):
+                for sector, V, I, D in zip(demand.sectors, demand.V, demand.intensity, demand.sector_demand):
+                    self.demand_records.append({
+                        "year": t, "stage": stage.name, "sector": sector,
+                        "driver": float(V), "intensity": float(I), "nominal_demand": float(D),
+                        "q_nom": demand.q_nom, "p_nom": demand.p_nom, "p_eq": stage.p_eq,
+                        "realised": float(output.sum()),
+                    })
 
             for pool_name, plants in stage.all_pools().items():
                 for plant in plants:

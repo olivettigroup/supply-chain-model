@@ -259,28 +259,75 @@ class SupplyCurve2D():
 
         return demand.item() if np.isscalar(p_d) else demand
     
-class DemandCurve():
-    def __init__(self, p_nom, q_nom, elas):
-        """Simple power law demand curve following A*p**elas.
+class SectorDemand():
+    def __init__(self, base_price, elasticity, V0, I0, cagr, phi=1.0, chi=1.0, sectors=None):
+        """Demand of a leaf stage, built bottom-up from sectors: D(p) = q_nom * (p / p_nom)**elasticity.
+
+        Each sector s has a driver V_s (e.g. units sold) and an intensity I_s (material per driver
+        unit); its nominal demand is D_s = V_s * I_s, and q_nom = sum of D_s. The curve passes through
+        (p_nom, q_nom): p_nom is base_price in the first year and last year's equilibrium price after
+        that. Sector arguments are arrays with one entry per sector, or scalars for a single sector.
 
         Args:
-            A (float): Reference quantity
-            elas (float): Price elasticity.
+            base_price (float): Price at which the first year's nominal demand applies.
+            elasticity (float): Price elasticity of the stage's demand.
+            V0 (array): Drivers in the first year.
+            I0 (array): Intensities in the first year (0 allowed).
+            cagr (array): Driver growth rates at the start of the run.
+            phi (array, optional): Factor by which driver growth is scaled by the end of the run.
+                Defaults to 1 (constant growth).
+            chi (array, optional): Factor by which intensity has changed by the end of the run. Defaults
+                to 1 (constant intensity).
+            sectors (list, optional): Sector names. Defaults to "sector 0", "sector 1", ...
         """
-        self.q_nom = q_nom
-        self.p_nom = p_nom
-        self.elas = elas
-        self.refresh()
+        V0, I0, cagr, phi, chi = np.broadcast_arrays(*(np.atleast_1d(np.asarray(x, dtype=float))
+                                                       for x in (V0, I0, cagr, phi, chi)))
+        self.V = V0.copy()
+        self.I0 = I0.copy()
+        self.cagr = cagr.copy()
+        self.phi = phi.copy()
+        self.chi = chi.copy()
+        self.k = np.ones_like(self.V)
+        self.sectors = list(sectors) if sectors is not None else [f"sector {i}" for i in range(len(self.V))]
+        if len(self.sectors) != len(self.V):
+            raise ValueError(f"{len(self.sectors)} sector names for {len(self.V)} sectors.")
+        self.elasticity = elasticity
+        self.p_nom = base_price
+        self.q_nom = float(np.sum(self.sector_demand))
 
-    def refresh(self):
-        """Recompute A from the current p_nom / q_nom / elas.
+    @property
+    def intensity(self):
+        """Each sector's intensity this year: I0 * k."""
+        return self.I0*self.k
 
-        p_nom and q_nom are mutated in place each year, so A goes stale without this.
+    @property
+    def sector_demand(self):
+        """Each sector's nominal demand this year: V * I."""
+        return self.V*self.intensity
+
+    def step(self, t, last_price, params):
+        """Demand update for year t: advance every sector's driver and intensity, then re-anchor the
+        curve at last year's equilibrium price.
+
+            x        = (t - t0) / (T - t0), clipped at 1, with t0 = start_year and T = end_year
+            V(s, t)  = V(s, t-1) * (1 + cagr_s * phi_s**x)
+            I(s, t)  = I0_s * chi_s**x
+            q_nom(t) = sum of V(s, t) * I(s, t),  p_nom(t) = last_price
+
+        Args:
+            t (int): Year being stepped into.
+            last_price (float): The stage's equilibrium price last year.
+            params (ModelParams): Model parameters; uses start_year and end_year.
         """
-        self.A = self.q_nom / self.p_nom**self.elas
+        x = min((t - params.start_year)/max(params.end_year - params.start_year, 1), 1.0)
+        self.V = self.V*(1 + self.cagr*self.phi**x)
+        self.k = self.chi**x
+        self.q_nom = float(np.sum(self.sector_demand))
+        self.p_nom = last_price
 
     def __call__(self, p):
-        return self.A*p**self.elas
+        """Quantity demanded at price(s) p."""
+        return self.q_nom*(np.asarray(p, dtype=float)/self.p_nom)**self.elasticity
 
 def find_intersection(supply_curve, demand_curve, bracket):
     """Finds the intersection of a supply and demand curve.
