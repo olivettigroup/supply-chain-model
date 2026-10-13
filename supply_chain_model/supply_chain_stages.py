@@ -290,7 +290,7 @@ def present_value(cash, rate):
     return float(np.sum(cash/(1 + rate)**np.arange(len(cash))))
 
 
-def mine_npv(mine, ctx, params, price_path_fn):
+def mine_npv(mine, prices, params, grade_fn):
     """Net present value of deciding to open a mine now.
 
     Years are counted from the decision year, k = 0, matching the simulation calendar: a mine that
@@ -299,14 +299,14 @@ def mine_npv(mine, ctx, params, price_path_fn):
       if construction_time is 0).
     - Production: k = construction_time ... construction_time + mine_life - 1, at full capacity, with
       cash flow (price - cost) * quantity. Capacity and cost follow the projected grade path (the
-      stage's grade_fn at utilisation 1), and cumulative production stops at the mine's reserves.
+      grade_fn at utilisation 1), and cumulative production stops at the mine's reserves.
     - Each year is discounted by (1 + discount_rate)**k.
 
     Args:
         mine (Mine): The mine. It is not modified.
-        ctx (PoolContext): Context of the mine's stage; ctx.stage.grade_fn gives the grade path.
+        prices (array): Expected price in each of the mine_life production years.
         params (ModelParams): Model parameters.
-        price_path_fn (callable): price_path_fn(ctx, stage_name, n_years) -> price in each production year.
+        grade_fn (callable): grade_fn(grade, utilisation, params) -> next year's grade.
 
     Returns:
         float: The NPV.
@@ -317,7 +317,7 @@ def mine_npv(mine, ctx, params, price_path_fn):
     grade = mine.grade
     for j in range(life):
         grades[j] = grade
-        grade = ctx.stage.grade_fn(grade, 1.0, params)
+        grade = grade_fn(grade, 1.0, params)
 
     capacity = mine.ore_throughput*grades*mine.recovery
     cost = mine.ore_cost/(grades*mine.recovery)
@@ -327,11 +327,11 @@ def mine_npv(mine, ctx, params, price_path_fn):
     capex_years = max(build, 1)
     cash = np.zeros(build + life)
     cash[:capex_years] -= mine.capex/capex_years
-    cash[build:] += (price_path_fn(ctx, ctx.stage.name, life) - cost)*quantity
+    cash[build:] += (prices - cost)*quantity
     return present_value(cash, params.discount_rate)
 
 
-def plant_npv(plant, ctx, params, price_path_fn):
+def plant_npv(plant, prices, parent_prices, params):
     """Net present value of building a processing plant now, and the present value of its capex.
 
     Years are counted from the decision year, k = 0: a plant built in year t operates from year
@@ -340,15 +340,15 @@ def plant_npv(plant, ctx, params, price_path_fn):
       it at k = 0 if plant_construction_time is 0).
     - Production: k = plant_construction_time ... plant_construction_time + plant_life - 1, at full
       capacity, with cash flow (p_k - c_k - intensity * p_parent_k) * capacity. The plant learns from
-      construction on: c_k = conversion_cost * (1 - plant_learning_rate)**k. Prices come from
-      price_path_fn for the stage and its parent (0 for a stage with no parent).
+      construction on: c_k = conversion_cost * (1 - plant_learning_rate)**k.
     - Each year is discounted by (1 + discount_rate)**k.
 
     Args:
         plant (SupplyPlant): The candidate plant, with capacity, conversion_cost, intensity and capex set.
-        ctx (PoolContext): Context of the plant's stage.
+        prices (array): Expected price of the stage in each of the plant_life production years.
+        parent_prices (array): Expected price of the parent stage in those years (zeros for a stage
+            with no parent).
         params (ModelParams): Model parameters.
-        price_path_fn (callable): price_path_fn(ctx, stage_name, n_years) -> price in each production year.
 
     Returns:
         tuple: (NPV, present value of the capex).
@@ -360,12 +360,10 @@ def plant_npv(plant, ctx, params, price_path_fn):
     capex = np.zeros(build + life)
     capex[:capex_years] = plant.capex/capex_years
 
-    price = price_path_fn(ctx, ctx.stage.name, life)
-    parent_price = np.zeros(life) if ctx.stage.parent is None else price_path_fn(ctx, ctx.stage.parent.name, life)
     cost = plant.conversion_cost*(1 - params.plant_learning_rate)**k[build:]
 
     cash = -capex
-    cash[build:] += (price - cost - (plant.intensity or 0.0)*parent_price)*plant.capacity
+    cash[build:] += (prices - cost - (plant.intensity or 0.0)*parent_prices)*plant.capacity
     return present_value(cash, params.discount_rate), present_value(capex, params.discount_rate)
 
 
@@ -394,9 +392,10 @@ def exhausted(plants, ctx):
 def positive_npv(plants, ctx):
     """incentive -> opening: every mine with a positive NPV, with no cap. Stores npv_at_decision on
     each mover."""
+    prices = ctx.stage.price_path_fn(ctx, ctx.stage.name, ctx.params.mine_life)
     movers = []
     for mine in plants:
-        npv = mine_npv(mine, ctx, ctx.params, ctx.stage.price_path_fn)
+        npv = mine_npv(mine, prices, ctx.params, ctx.stage.grade_fn)
         if npv > 0:
             mine.npv_at_decision = npv
             movers.append(mine)
@@ -859,7 +858,10 @@ class ProcessingStage(SupplyChainStage):
         intensity = getattr(self.supply, "intensity", None) or 0.0
         template = SupplyPlant(capacity, self.frontier_cost, intensity=intensity,
                                capex=self.capex_intensity*capacity, synthetic=True)
-        npv, pv_capex = plant_npv(template, ctx, params, self.price_path_fn)
+        prices = self.price_path_fn(ctx, self.name, params.plant_life)
+        parent_prices = (np.zeros(params.plant_life) if self.parent is None
+                         else self.price_path_fn(ctx, self.parent.name, params.plant_life))
+        npv, pv_capex = plant_npv(template, prices, parent_prices, params)
         if npv <= 0:
             return
 
