@@ -7,16 +7,16 @@ e.g. ``from supply_chain_model import SupplyChain``. Everything else stays in it
 
 from .supply_chain import ModelParams, SupplyChain, StageContext
 from .supply_chain_stages import (
-    SupplyPlant, Mine, WasteStream,
+    SupplyPlant, Mine, WasteStream, RecycledSupply,
     SupplyChainStage, MiningStage, ProcessingStage,
     Pipeline, PoolContext, mine_npv, plant_npv, default_grade_fn, flat_decision_price,
 )
-from .utils import SupplyCurve, SupplyCurve2D, Sector, CompositeDemand, generate_cost_curve
+from .utils import SupplyCurve, SupplyCurve2D, Sector, CompositeDemand, RecyclingTechnology, generate_cost_curve
 
 __all__ = [
     "ModelParams", "SupplyChain", "StageContext",
-    "SupplyPlant", "Mine", "WasteStream",
+    "SupplyPlant", "Mine", "WasteStream", "RecycledSupply",
     "SupplyChainStage", "MiningStage", "ProcessingStage",
     "Pipeline", "PoolContext", "mine_npv", "plant_npv", "default_grade_fn", "flat_decision_price",
-    "SupplyCurve", "SupplyCurve2D", "Sector", "CompositeDemand", "generate_cost_curve",
+    "SupplyCurve", "SupplyCurve2D", "Sector", "CompositeDemand", "RecyclingTechnology", "generate_cost_curve",
 ]

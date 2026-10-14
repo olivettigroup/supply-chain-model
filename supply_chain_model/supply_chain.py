@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .utils import build_chain, solve_chain, SupplyCurve2D, MIN_COST_FACTOR
-from .supply_chain_stages import MiningStage
+from .supply_chain_stages import MiningStage, ProcessingStage
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,12 @@ class ModelParams:
         max_expansion_share (float): Cap on the capacity built in a year, as a share of last year's
             operating capacity.
         max_idle_years (int): Years a processing plant can stay idle before it closes.
+        lifetime_sd_fraction (float): A sector's lifetime standard deviation as a fraction of its mean
+            lifetime, when the sector gives none.
+        recycling (bool): Offer the sectors' secondary material as recycled supply at the processing
+            stages they target. End-of-life flows are worked out either way.
+        recycling_cost_percentile (float): Percentile of a target stage's regular operating plants'
+            total costs in the first year that sets the cost of its recycled supply.
     """
     start_year: int = 2024
     end_year: int = 2050
@@ -60,6 +66,9 @@ class ModelParams:
     expansion_speed: float = 0.5
     max_expansion_share: float = 0.15
     max_idle_years: int = 3
+    lifetime_sd_fraction: float = 0.25
+    recycling: bool = False
+    recycling_cost_percentile: float = 25
 
 
 class SupplyChain:
@@ -104,6 +113,10 @@ class SupplyChain:
                 if name not in self.stage_idx or not any(sector is d for d in self.stages[self.stage_idx[name]].demand.sectors):
                     raise ValueError(f"Sector {sector.name!r} draws from {name!r}, which is not a stage whose "
                                      "CompositeDemand lists the sector.")
+        for sector in self.sectors:
+            sector.set_params(self.params)
+        if self.params.recycling:
+            self._add_recycled_supply()
 
         # Filled in as the run goes: deepcopy snapshots, prices by name, one record row per plant per year,
         # one demand row per sector per drawn stage per year
@@ -114,6 +127,35 @@ class SupplyChain:
 
         self._current_year = None
         self.verbosity = verbosity
+
+    def _secondary_inflows(self):
+        """This year's secondary material per target stage: the sum over sectors and drawn stages of
+        secondary(s, e) whose recycling target is that stage.
+
+        Returns:
+            dict: {target stage name: secondary material}.
+        """
+        inflows = {}
+        for sector in self.sectors:
+            for stage, amount in sector.secondary.items():
+                target = sector.recycling_targets[stage]
+                inflows[target] = inflows.get(target, 0.0) + amount
+        return inflows
+
+    def _add_recycled_supply(self):
+        """Give every stage that a sector's recycling targets name one recycled-supply plant, stocked
+        with the first year's secondary material. Only processing stages can take recycled material.
+        """
+        inflows = self._secondary_inflows()
+        for sector in self.sectors:
+            for target in sector.recycling_targets.values():
+                if target not in self.stage_idx:
+                    raise ValueError(f"Sector {sector.name!r} sends recycled material to {target!r}, which is not a stage.")
+                if not isinstance(self.stages[self.stage_idx[target]], ProcessingStage):
+                    raise ValueError(f"Sector {sector.name!r} sends recycled material to {target!r}; only "
+                                     "processing stages can take recycled material.")
+        for target in dict.fromkeys(t for sector in self.sectors for t in sector.recycling_targets.values()):
+            self.stages[self.stage_idx[target]].add_recycled_supply(inflows.get(target, 0.0))
 
     def snapshot(self, t):
         """Stages for a given year.
@@ -166,8 +208,10 @@ class SupplyChain:
         """Sector demand as a DataFrame: one row per sector per drawn stage per year.
 
         Columns: year, sector, stage, nominal_driver (V_nom), driver (V at the solved prices),
-        sector_price (P at the solved prices), p_nom (P_nom), intensity, and consumption
-        (intensity * driver, what the sector took from the stage).
+        sector_price (P at the solved prices), p_nom (P_nom), intensity, consumption (intensity *
+        driver, what the sector took from the stage), eol and secondary (that year's end-of-life and
+        secondary material), and backcast. Backcast rows (backcast = True) cover the years before the
+        run of sectors with a lifetime, with only nominal_driver, intensity and consumption filled in.
 
         Returns:
             pandas.DataFrame: The recorded rows.
@@ -271,10 +315,11 @@ class SupplyChain:
                 # Built once, eagerly, from last year's solved chain. Stages may only read this, never
                 # each other, so it doesn't matter what order they get stepped in.
                 ctx = StageContext(self.stages, t)
-                for stage in self.stages:
-                    stage.step(ctx)
                 for sector in self.sectors:
                     sector.step(ctx, self.params)
+                ctx.add_secondary(self._secondary_inflows())
+                for stage in self.stages:
+                    stage.step(ctx)
 
             # Scenario hook can mutate this year's stages before they're solved
             if scenario is not None:
@@ -298,6 +343,15 @@ class SupplyChain:
         self.prices[t] = dict(prices)
         self.prices[t].update({f"{s.name} (decision)": s.decision_price for s in self.stages})
 
+        if t == self.params.start_year:
+            for sector in self.sectors:
+                for year in sorted(y for y in sector.history if y < t):
+                    driver, intensities = sector.history[year]
+                    for name, intensity in intensities.items():
+                        self.demand_records.append({
+                            "year": year, "sector": sector.name, "stage": name, "nominal_driver": driver,
+                            "intensity": intensity, "consumption": intensity*driver, "backcast": True,
+                        })
         for sector in self.sectors:
             driver = sector.volume(prices)
             for name, intensity in sector.intensities.items():
@@ -306,6 +360,7 @@ class SupplyChain:
                     "nominal_driver": sector.V, "driver": driver,
                     "sector_price": sector.price(prices), "p_nom": sector.P_nom,
                     "intensity": intensity, "consumption": intensity*driver,
+                    "eol": sector.eol[name], "secondary": sector.secondary[name], "backcast": False,
                 })
 
         for stage in self.stages:
@@ -365,6 +420,7 @@ class StageContext:
             year (int): The year being stepped into.
         """
         self.year = year
+        self._secondary = {}
         self._prices = {s.name: s.p_eq for s in stages}
         self._decision_prices = {s.name: s.decision_price for s in stages}
 
@@ -394,6 +450,19 @@ class StageContext:
     def stage_name_of(self, plant):
         """Name of the stage the given plant belongs to."""
         return self._stage_name[plant.uid]
+
+    def add_secondary(self, inflows):
+        """Give the context this year's secondary material per target stage. Called by SupplyChain.run
+        once the sectors have stepped, before any stage steps.
+
+        Args:
+            inflows (dict): {target stage name: secondary material}.
+        """
+        self._secondary = dict(inflows)
+
+    def secondary_into(self, name):
+        """This year's secondary material sent to the named stage (0 if none)."""
+        return self._secondary.get(name, 0.0)
 
     def consumed_by(self, plant):
         """This plant's own realized output at equilibrium (what it actually produced/consumed last year)."""

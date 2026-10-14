@@ -148,6 +148,36 @@ class WasteStream(SupplyPlant):
             self.capacity = inflow
 
 
+class RecycledSupply(SupplyPlant):
+    def __init__(self, stock, cost, uid=None):
+        """End-of-life supply at a processing stage: the stage's whole stock of secondary material from
+        the sectors' end of life, offered at a fixed cost. It uses no parent material.
+
+        Args:
+            stock (float): Secondary material available, which is the plant's capacity.
+            cost (float): Cost per unit, fixed for the whole run.
+            uid (int, optional): Stable identifier. Defaults to the next value of the shared counter.
+        """
+        super().__init__(stock, cost, intensity=0, uid=uid)
+        self.stock = stock
+
+    def step(self, ctx):
+        """Stock accounting: stock = stock + this year's secondary inflow to the stage - what the plant
+        supplied last year; capacity = stock.
+
+        Args:
+            ctx (StageContext): Read-only view of last year's solved chain, with this year's inflows.
+        """
+        inflow = ctx.secondary_into(ctx.stage_name_of(self))
+        self.stock = max(self.stock + inflow - ctx.consumed_by(self), 0.0)
+        self.capacity = self.stock
+
+
+def is_regular(plant):
+    """A processing plant built for primary production: neither a waste stream nor recycled supply."""
+    return not isinstance(plant, (WasteStream, RecycledSupply))
+
+
 # ---------------------------------------------------------------------------
 # Pool machinery
 #
@@ -409,9 +439,9 @@ def margin(plant, ctx):
 
 
 def negative_margin(plants, ctx):
-    """operating -> idle: every plant whose margin at last year's decision prices is negative. Waste
-    streams never go idle."""
-    return [plant for plant in plants if not isinstance(plant, WasteStream) and margin(plant, ctx) < 0]
+    """operating -> idle: every regular plant whose margin at last year's decision prices is negative.
+    Waste streams and recycled supply never go idle."""
+    return [plant for plant in plants if is_regular(plant) and margin(plant, ctx) < 0]
 
 
 def margin_recovered(plants, ctx):
@@ -755,7 +785,9 @@ class ProcessingStage(SupplyChainStage):
         is positive.
 
         Waste streams sit in operating for good: they never go idle, close or expand, but they follow
-        the learning rule and count in the operating capacity that scales expansion.
+        the learning rule and count in the operating capacity that scales expansion. Recycled supply
+        (RecycledSupply, at most one per stage) also stays in operating, but neither learns nor counts in
+        that capacity.
 
         Args:
             supply (callable): Supply for that stage. Its plants become the operating pool.
@@ -782,7 +814,7 @@ class ProcessingStage(SupplyChainStage):
             params (ModelParams): Model parameters.
         """
         super().set_params(params)
-        regular = [plant.conversion_cost for plant in self.pools["operating"] if not isinstance(plant, WasteStream)]
+        regular = [plant.conversion_cost for plant in self.pools["operating"] if is_regular(plant)]
         self.frontier_cost = float(np.percentile(regular, params.expansion_cost_percentile)) if regular else None
 
     def add_plants(self, new_plants):
@@ -794,6 +826,18 @@ class ProcessingStage(SupplyChainStage):
         self.supply.add_plants(new_plants)
         self.pools["operating"] = list(self.supply.plants)
 
+    def add_recycled_supply(self, stock):
+        """Add the stage's recycled supply to the operating pool. Its cost is the
+        recycling_cost_percentile of the regular operating plants' total costs, set now and kept.
+
+        Args:
+            stock (float): Secondary material available in the first year.
+        """
+        costs = [plant.cost for plant in self.pools["operating"] if is_regular(plant)]
+        plant = RecycledSupply(stock, float(np.percentile(costs, self.params.recycling_cost_percentile)))
+        self.pools["operating"].append(plant)
+        self.set_plants(self.pools["operating"])
+
     def step(self, ctx):
         """Advance the stage by one year, in place. Decisions use last year's decision prices.
 
@@ -801,11 +845,12 @@ class ProcessingStage(SupplyChainStage):
         2. idle -> operating: margin back at 0 or above (margin_recovered); the plant produces this year.
         3. idle -> closed after max_idle_years years idle.
         4. operating -> idle: negative margin (negative_margin).
-        5. Learning on every construction and operating plant (_learn).
+        5. Learning on every construction and operating plant except recycled supply (_learn).
         6. construction -> operating after plant_construction_time years.
         7. The technology frontier moves on a year (_advance_frontier).
         8. Expansion with template plants at the frontier (_expand), measured on last year's pools.
-        9. Waste-stream capacities from their source flows (WasteStream.step).
+        9. Waste-stream capacities from their source flows (WasteStream.step) and the recycled-supply
+           stock (RecycledSupply.step).
         10. The supply curve is rebuilt from the operating pool, at last year's parent price.
 
         A plant that goes idle in year t and never recovers closes in year t + max_idle_years, after
@@ -822,8 +867,8 @@ class ProcessingStage(SupplyChainStage):
         pool_ctx = PoolContext(self, ctx)
         moved = set()
         # Last year's pools, before any move: expansion is measured against them
-        last_operating = sum(plant.capacity for plant in self.pools["operating"])
-        last_regular = [plant.capacity for plant in self.pools["operating"] if not isinstance(plant, WasteStream)]
+        last_operating = sum(plant.capacity for plant in self.pools["operating"] if not isinstance(plant, RecycledSupply))
+        last_regular = [plant.capacity for plant in self.pools["operating"] if is_regular(plant)]
 
         self.pipeline.age(self.pools, moved)
         self.pipeline.move(self.pools, "idle", "operating", margin_recovered, pool_ctx, moved)
@@ -836,7 +881,7 @@ class ProcessingStage(SupplyChainStage):
         self._expand(pool_ctx, last_operating, last_regular)
 
         for plant in self.pools["operating"]:
-            if isinstance(plant, WasteStream):
+            if not is_regular(plant):
                 plant.step(ctx)
 
         self.set_plants(self.pools["operating"])
@@ -845,10 +890,11 @@ class ProcessingStage(SupplyChainStage):
 
     def _learn(self):
         """Learning: conversion cost falls by plant_learning_rate for every plant in construction or
-        operating, waste streams included. Idle plants don't learn."""
+        operating, waste streams included. Idle plants and recycled supply don't learn."""
         for name in ("construction", "operating"):
             for plant in self.pools[name]:
-                plant.conversion_cost *= (1 - self.params.plant_learning_rate)
+                if not isinstance(plant, RecycledSupply):
+                    plant.conversion_cost *= (1 - self.params.plant_learning_rate)
 
     def _advance_frontier(self):
         """Technology frontier: the conversion cost of a newly built plant falls by technology_rate a year."""
@@ -865,12 +911,13 @@ class ProcessingStage(SupplyChainStage):
             PI          = NPV / PV(capex)        (profitability index)
             build_share = min(max_expansion_share, expansion_speed * PI)
             n_plants    = build_share * last year's operating capacity / template capacity, rounded to
-                          the nearest whole plant (waste streams count in the operating capacity)
+                          the nearest whole plant (waste streams count in the operating capacity,
+                          recycled supply doesn't)
         New plants are synthetic and get a (year, "construction") entry in their pool_history.
 
         Args:
             ctx (PoolContext): Context of this stage.
-            last_operating (float): Operating capacity during last year's solve.
+            last_operating (float): Operating capacity during last year's solve, without recycled supply.
             last_regular (list): Capacities of last year's regular operating plants.
         """
         params = self.params

@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.optimize import root_scalar, least_squares
+from scipy.stats import norm
 
 # Parameters to generate random cost curves. Taken from global Cu cost curve from S&P
 MINE_DISTRIBUTION_MEAN = np.array([-7.6971, 0.323])
@@ -15,6 +16,10 @@ SHARPNESS = 500
 # negative conversion cost would get a negative total cost and the curve would return nan.
 # SupplyChain.solve_prices warns if it binds at a solved price.
 MIN_COST_FACTOR = 0.05
+
+# Truncation of a sector's fate curve, in standard deviations past the mean lifetime: what would return
+# later is spread back over the ages kept by the rescaling. A numerical guard, not a model parameter.
+FATE_CURVE_SDS = 4
 
 def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000), rng=None):
     """Randomly generates a number of plants for any supply chain stage
@@ -259,15 +264,44 @@ class SupplyCurve2D():
 
         return demand.item() if np.isscalar(p_d) else demand
     
+def run_fraction(t, params):
+    """How far year t is through the run: x = (t - start_year) / (end_year - start_year), not clipped
+    (negative before the run, above 1 after it). end_year - start_year is taken as at least 1."""
+    return (t - params.start_year)/max(params.end_year - params.start_year, 1)
+
+
+class RecyclingTechnology():
+    def __init__(self, name, recovery_rates):
+        """A recycling technology: the share of each element in collected, disassembled scrap that it
+        recovers. Several sectors can send their scrap through the same technology.
+
+        Args:
+            name (str): Technology name.
+            recovery_rates (dict): {stage name: recovery rate}. An element not listed is not recovered.
+        """
+        self.name = name
+        self.recovery_rates = dict(recovery_rates)
+
+    def recovery(self, stage_name):
+        """Recovery rate of the element of the named stage (0 if the technology doesn't recover it)."""
+        return self.recovery_rates.get(stage_name, 0.0)
+
+
 class Sector():
-    def __init__(self, name, elasticity, V0, cagr, intensities, phi=1.0, chi=1.0, other_cost=0.0):
+    def __init__(self, name, elasticity, V0, cagr, intensities, phi=1.0, chi=1.0, other_cost=0.0,
+                 lifetime=None, lifetime_sd=None, collection_rate=1.0, disassembly_rate=1.0, technology=None,
+                 recycling_targets=None, history_growth=None):
         """A demand sector (e.g. a product): one driver volume that responds to the price of its
-        inputs, drawing material from one or more stages.
+        inputs, drawing material from one or more stages, and whose products come back as end-of-life
+        scrap.
 
         Its input price is P = other_cost + sum over drawn stages e of I_e * p_e, and its volume is
         V = V_nom * (P / P_nom)**elasticity. The curve passes through (P_nom, V_nom): P_nom is the
         input price at the drawn stages' base prices in the first year, and at last year's equilibrium
         prices after that. Stage e draws I_e * V.
+
+        What the sector consumed comes back at end of life spread around its lifetime (fate curve),
+        and collection, disassembly and the technology's recovery turn it into secondary material.
 
         Args:
             name (str): Sector name, used in the records.
@@ -282,6 +316,18 @@ class Sector():
                 Defaults to 1 (constant intensity).
             other_cost (float, optional): Non-material cost per driver unit, part of the input price.
                 Defaults to 0.
+            lifetime (float, optional): Mean product lifetime L in years. Defaults to None (no end of life).
+            lifetime_sd (float, optional): Standard deviation of the lifetime. Defaults to
+                params.lifetime_sd_fraction * lifetime.
+            collection_rate (float, optional): Share of end-of-life products collected. Defaults to 1.
+            disassembly_rate (float, optional): Share of the collected material that can be physically
+                extracted. Defaults to 1.
+            technology (RecyclingTechnology, optional): Technology the scrap goes through. Defaults to
+                None (nothing is recovered).
+            recycling_targets (dict, optional): {drawn stage: stage the recycled material re-enters}.
+                Defaults to each element re-entering its own stage.
+            history_growth (float, optional): Driver growth rate before the run, used by the backcast
+                instead of cagr * phi**x. Defaults to None.
         """
         self.name = name
         self.elasticity = elasticity
@@ -296,6 +342,24 @@ class Sector():
         # stages are built; P_nom is set once every drawn stage has one
         self.prices = {}
         self.P_nom = None
+
+        self.lifetime = lifetime
+        self.lifetime_sd = lifetime_sd
+        self.collection_rate = collection_rate
+        self.disassembly_rate = disassembly_rate
+        self.technology = technology
+        self.history_growth = history_growth
+        unknown = set(recycling_targets or {}) - set(self.I0)
+        if unknown:
+            raise ValueError(f"Sector {name!r} has recycling targets for stages it doesn't draw from: {sorted(unknown)}.")
+        self.recycling_targets = {stage: (recycling_targets or {}).get(stage, stage) for stage in self.I0}
+        # {year: (driver, {stage: intensity})}: backcast years, then each model year's realised volume
+        self.history = {}
+        # Set by set_params: fate-curve ages and weights, and this year's end-of-life flows per drawn stage
+        self.ages = np.array([], dtype=int)
+        self.fate = np.array([])
+        self.eol = {stage: 0.0 for stage in self.I0}
+        self.secondary = {stage: 0.0 for stage in self.I0}
 
     @property
     def intensities(self):
@@ -328,24 +392,84 @@ class Sector():
         if set(self.prices) == set(self.I0):
             self.P_nom = self.price(self.prices)
 
-    def step(self, ctx, params):
-        """Sector update for year ctx.year: advance the driver and the intensities, then re-anchor the
-        curve at last year's equilibrium prices.
+    def set_params(self, params):
+        """Give the sector its model parameters. A sector with a lifetime builds its fate curve,
+        backcasts its history (_backcast) and works out the first year's end of life (_end_of_life).
 
-            x        = (t - t0) / (T - t0), clipped at 1, with t0 = start_year and T = end_year
-            V_nom(t) = V_nom(t-1) * (1 + cagr * phi**x)
-            I_e(t)   = I0_e * chi**x
-            P_nom(t) = other_cost + sum of I_e(t) * p_e(t-1)
+        Fate curve: the share of a year's consumption reaching end of life at age a is
+            f(a) = Phi(a + 1/2) - Phi(a - 1/2),   a = 1 ... ceil(L + FATE_CURVE_SDS * l)
+        with Phi the cumulative normal of mean L and standard deviation l, rescaled to sum to 1.
+
+        Args:
+            params (ModelParams): Model parameters; uses start_year, end_year and lifetime_sd_fraction.
+        """
+        if self.lifetime is None:
+            return
+        sd = self.lifetime_sd if self.lifetime_sd is not None else params.lifetime_sd_fraction*self.lifetime
+        self.ages = np.arange(1, int(np.ceil(self.lifetime + FATE_CURVE_SDS*sd)) + 1)
+        fate = norm.cdf(self.ages + 0.5, self.lifetime, sd) - norm.cdf(self.ages - 0.5, self.lifetime, sd)
+        self.fate = fate/fate.sum()
+        self._backcast(params)
+        self._end_of_life(params.start_year)
+
+    def _backcast(self, params):
+        """Backcast: fill the history for the fate curve's span before start_year by running the
+        sector's own equations backwards from V0 and I0, with x negative and not clipped:
+
+            g(t)     = cagr * phi**x(t), or history_growth when given
+            V(t - 1) = V(t) / (1 + g(t))
+            I_e(t)   = I0_e * chi**x(t)
+
+        Args:
+            params (ModelParams): Model parameters; uses start_year and end_year.
+        """
+        V = self.V
+        for t in range(params.start_year, params.start_year - len(self.ages), -1):
+            growth = self.history_growth if self.history_growth is not None else self.cagr*self.phi**run_fraction(t, params)
+            V = V/(1 + growth)
+            k = self.chi**run_fraction(t - 1, params)
+            self.history[t - 1] = (V, {stage: I*k for stage, I in self.I0.items()})
+
+    def _end_of_life(self, t):
+        """End of life in year t, per drawn stage, from the consumption of years up to t - 1:
+
+            EOL(e, t)       = sum over ages a of f(a) * V(t - a) * I_e(t - a)
+            secondary(e, t) = EOL * collection_rate * disassembly_rate * recovery rate of e
+
+        Args:
+            t (int): Year.
+        """
+        for stage in self.I0:
+            eol = sum(f*self.history[t - a][0]*self.history[t - a][1][stage] for a, f in zip(self.ages, self.fate))
+            recovery = self.technology.recovery(stage) if self.technology is not None else 0.0
+            self.eol[stage] = eol
+            self.secondary[stage] = eol*self.collection_rate*self.disassembly_rate*recovery
+
+    def step(self, ctx, params):
+        """Sector update for year ctx.year: record last year's realised volume, advance the driver and
+        the intensities, re-anchor the curve at last year's equilibrium prices, then work out this
+        year's end of life (_end_of_life).
+
+            history(t-1) = V at last year's prices, with last year's intensities
+            x            = (t - t0) / (T - t0), clipped at 1, with t0 = start_year and T = end_year
+            V_nom(t)     = V_nom(t-1) * (1 + cagr * phi**x)
+            I_e(t)       = I0_e * chi**x
+            P_nom(t)     = other_cost + sum of I_e(t) * p_e(t-1)
 
         Args:
             ctx (StageContext): Read-only view of last year's solved chain.
             params (ModelParams): Model parameters; uses start_year and end_year.
         """
-        x = min((ctx.year - params.start_year)/max(params.end_year - params.start_year, 1), 1.0)
+        prices = {stage: ctx.price_of(stage) for stage in self.I0}
+        self.history[ctx.year - 1] = (self.volume(prices), self.intensities)
+
+        x = min(run_fraction(ctx.year, params), 1.0)
         self.V = self.V*(1 + self.cagr*self.phi**x)
         self.k = self.chi**x
-        self.prices = {stage: ctx.price_of(stage) for stage in self.I0}
+        self.prices = prices
         self.P_nom = self.price(self.prices)
+        if self.lifetime is not None:
+            self._end_of_life(ctx.year)
 
 def find_intersection(supply_curve, demand_curve, bracket):
     """Finds the intersection of a supply and demand curve.
