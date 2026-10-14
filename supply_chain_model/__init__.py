@@ -12,6 +12,10 @@ from .supply_chain_stages import (
     Pipeline, PoolContext, mine_npv, plant_npv, default_grade_fn, flat_decision_price,
 )
 from .utils import SupplyCurve, SupplyCurve2D, Sector, CompositeDemand, RecyclingTechnology, generate_cost_curve
+from .data import (
+    ModelInput, generate_inputs, fill_from_summaries, validate_inputs, params_from_inputs, chain_from_inputs,
+    write_template, write_inputs, load_inputs, write_results,
+)
 
 __all__ = [
     "ModelParams", "SupplyChain", "StageContext",
@@ -19,4 +23,6 @@ __all__ = [
     "SupplyChainStage", "MiningStage", "ProcessingStage",
     "Pipeline", "PoolContext", "mine_npv", "plant_npv", "default_grade_fn", "flat_decision_price",
     "SupplyCurve", "SupplyCurve2D", "Sector", "CompositeDemand", "RecyclingTechnology", "generate_cost_curve",
+    "ModelInput", "generate_inputs", "fill_from_summaries", "validate_inputs", "params_from_inputs",
+    "chain_from_inputs", "write_template", "write_inputs", "load_inputs", "write_results",
 ]

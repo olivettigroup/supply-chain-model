@@ -12,6 +12,7 @@ dependencies = [
     "numpy",
     "scipy",
     "pandas",
+    "openpyxl",
 ]
 
 [tool.setuptools.packages.find]

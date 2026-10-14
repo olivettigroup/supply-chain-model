@@ -21,8 +21,13 @@ MIN_COST_FACTOR = 0.05
 # later is spread back over the ages kept by the rescaling. A numerical guard, not a model parameter.
 FATE_CURVE_SDS = 4
 
-def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000), rng=None):
+def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000), rng=None, cost_quantiles=None,
+                        capacity_log_sd=None):
     """Randomly generates a number of plants for any supply chain stage
+
+    Capacities and costs are drawn jointly from a distribution fitted to the global copper cost curve,
+    then the costs are rescaled linearly: either onto cost_bounds (the cheapest plant at the lower
+    bound, the dearest at the upper), or so that two percentiles of the drawn costs hit given values.
 
     Args:
         n_plants (int): Number of plants to generate
@@ -30,6 +35,13 @@ def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000), 
         cost_bounds (tuple, optional): Bounds for the generated costs. Defaults to (1000, 5000).
         rng (numpy.random.Generator, optional): Random generator, for reproducible draws. Defaults to a
             fresh unseeded one.
+        cost_quantiles (tuple, optional): ((q_low, cost_low), (q_high, cost_high)): the q_low-th and
+            q_high-th percentiles (0-100) of the costs land exactly on cost_low and cost_high (a single
+            plant gets cost_low). Replaces cost_bounds when given. Costs outside the two percentiles
+            follow the drawn shape, unclipped.
+        capacity_log_sd (float, optional): Standard deviation of log capacity, i.e. how uneven plant
+            sizes are. The correlation between capacity and cost stays that of the copper fit. Defaults
+            to the copper fit's own (about 2.15, which can put a fifth of the capacity in one plant).
 
     Returns:
         arrays: Arrays of length n_plants for capacities and costs
@@ -38,17 +50,29 @@ def generate_cost_curve(n_plants, total_capacity=300, cost_bounds=(1000, 5000), 
     if rng is None:
         rng = np.random.default_rng()
     
+    cov = MINE_DISTRIBUTION_COV
+    if capacity_log_sd is not None:
+        scale = capacity_log_sd/np.sqrt(cov[0, 0])
+        cov = cov*np.array([[scale**2, scale], [scale, 1.0]])
+
     # Generate random samples in log space
-    samples = rng.multivariate_normal(mean=MINE_DISTRIBUTION_MEAN, cov=MINE_DISTRIBUTION_COV, size=(n_plants))
+    samples = rng.multivariate_normal(mean=MINE_DISTRIBUTION_MEAN, cov=cov, size=(n_plants))
 
     # Clip to bounds or transform back into normal space
     samples[:, 0] = np.exp(samples[:, 0])
     samples[:, 1] = np.clip(samples[:, 1], MINE_DISTRIBUTION_COST_MIN, None)
 
-    # Rescale the samples to fit the desired total capacity and cost bounds
-    cost_min, cost_max = cost_bounds
-    samples[:, 1] = (samples[:, 1] - samples[:, 1].min()) / (samples[:, 1].max() - samples[:, 1].min() + 1e-12)
-    samples[:, 1] = cost_min + samples[:, 1] * (cost_max - cost_min)
+    # Rescale the samples to fit the desired total capacity and cost bounds or percentiles
+    if cost_quantiles is not None:
+        (q_low, cost_low), (q_high, cost_high) = cost_quantiles
+        x_low, x_high = np.percentile(samples[:, 1], [q_low, q_high])
+        # A single plant (or identical draws) has no spread to rescale: it gets cost_low
+        slope = (cost_high - cost_low)/(x_high - x_low) if x_high > x_low else 0.0
+        samples[:, 1] = cost_low + (samples[:, 1] - x_low)*slope
+    else:
+        cost_min, cost_max = cost_bounds
+        samples[:, 1] = (samples[:, 1] - samples[:, 1].min()) / (samples[:, 1].max() - samples[:, 1].min() + 1e-12)
+        samples[:, 1] = cost_min + samples[:, 1] * (cost_max - cost_min)
 
     return samples[:, 0]*total_capacity/samples[:, 0].sum(), samples[:, 1]
 

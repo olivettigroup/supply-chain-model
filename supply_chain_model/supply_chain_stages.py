@@ -61,7 +61,7 @@ class SupplyPlant:
 
 class Mine(SupplyPlant):
     def __init__(self, capacity, cost, grade=1.0, recovery=1.0, reserves=None, capex=None, years_in_pool=0,
-                 uid=None):
+                 synthetic=False, uid=None):
         """A deposit, described by its ore and its reserves.
 
         The primitives are ore_throughput, grade, recovery and ore_cost; capacity and cost are derived
@@ -79,9 +79,11 @@ class Mine(SupplyPlant):
             capex (float, optional): Total capex in currency. Defaults to the stage's
                 capex_intensity * capacity, filled in when the stage is built.
             years_in_pool (int, optional): Full years spent in the current pool. Defaults to 0.
+            synthetic (bool, optional): True for mines the data generator created. Defaults to False.
             uid (int, optional): Stable identifier. Defaults to the next value of the shared counter.
         """
         self.uid = next(SupplyPlant._uid_counter) if uid is None else uid
+        self.synthetic = synthetic
         self.grade = grade
         self.recovery = recovery
         self.ore_throughput = capacity/(grade*recovery)
